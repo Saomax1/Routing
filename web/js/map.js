@@ -184,7 +184,8 @@ export class SlippyMap {
         let t = this.tiles.get(key);
         if (!t) {
           const img = new Image();
-          img.className = 'sm-tile'; img.alt = ''; img.draggable = false; img.referrerPolicy = 'no-referrer';
+          img.className = 'sm-tile'; img.alt = ''; img.draggable = false;
+          img.referrerPolicy = 'origin';   // tile servers (OpenStreetMap) block requests with no Referer; send only the site address, never a path
           img.onload = () => { img.classList.add('loaded'); this._tilesLoaded++; this.notice.hidden = true; };
           img.onerror = () => { this._tilesFailed++; img.remove(); this.tiles.delete(key); this._checkTiles(); };
           const wrapped = ((tx % n) + n) % n;

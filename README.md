@@ -109,8 +109,10 @@ See [`.env.example`](.env.example) for the full annotated list. The important on
   job is already past its window, options are ranked by speed and cost and the card says so. The Areas tab runs the same
   engine in a "soonest opening" mode.
 - **Map**: a small built-in slippy map. Pin shape = source (square AHS, diamond other warranty, circle direct), color =
-  priority, ring = deadline status. The tile source is `map.tile_url` in Settings (OpenStreetMap by default; swap it for
-  a commercial tile provider for heavier use).
+  priority, ring = deadline status. The tile source is `map.tile_url` in Settings (OpenStreetMap by default).
+  Tile requests send the site's address (no path) as the `Referer`, which OpenStreetMap requires; without it OSM
+  answers "403 Access blocked". OSM's free servers are for light use only, so for daily team use pick a commercial
+  tile provider (Stadia, MapTiler, Mapbox...) and paste its URL into `map.tile_url`.
 - **Sync** (`app/services/sync.py`): pulls from HCP, geocodes with a cache, deduplicates by description hash, and
   deactivates jobs that HCP no longer returns.
 
