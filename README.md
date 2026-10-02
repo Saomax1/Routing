@@ -18,6 +18,12 @@ cp .env.example .env                                   # defaults to HCP_MODE=mo
 python -m app                                          # run from the repo root
 ```
 
+**Windows:** type these in *Command Prompt* (press the Windows key, type `cmd`), not in the "Python" app (its lines start
+with `>>>` and it only understands Python, so shell commands give `SyntaxError: invalid syntax`). Use
+`.venv\Scripts\activate` instead of `source .venv/bin/activate` and `copy .env.example .env` instead of `cp`. If `python`
+is not recognized, use `py`. Windows has no built-in time zone database; the `tzdata` package in `requirements.txt`
+supplies it (without it you get `No time zone found with key America/Phoenix`: run `pip install tzdata`).
+
 Open <http://127.0.0.1:8000>. On first start in mock mode the app loads sanitized fake data and prints a one-time demo
 login (`admin@example.com` plus a random password) to the terminal. Copy it from there; it is not shown again.
 To pick your own admin login instead, set `ADMIN_EMAIL` and `ADMIN_PASSWORD` in `.env` before the first start, or run

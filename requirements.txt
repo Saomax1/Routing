@@ -2,3 +2,4 @@ starlette>=0.40
 uvicorn[standard]>=0.30
 itsdangerous>=2.1
 python-dotenv>=1.0
+tzdata>=2024.1
