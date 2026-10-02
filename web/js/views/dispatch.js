@@ -12,7 +12,8 @@ const onEnter = (fn) => (e) => { if (e.key === 'Enter' || e.key === ' ') { e.pre
 export function mountDispatch(root, ctx) {
   const { config } = ctx;
   const state = {
-    date: config.today, data: null, filters: { q: '', trade: '', source: '', priority: '' },
+    date: config.today, data: null, filters: { q: '', trade: '', source: '', priority: '', area: '' },
+    view: 'queue', areas: null, areasLoading: false, areasError: null, areaDays: null,
     hidden: new Set(), selectedId: null, detail: null, detailLoading: false,
     slots: null, slotsFor: null, slotsLoading: false, slotDays: 3, hoverOpt: null, pinnedOpt: null,
     firstFit: true, lastUpdated: null, error: null,
@@ -43,10 +44,13 @@ export function mountDispatch(root, ctx) {
       render(banner, icon('alert', 16), ` ${e.message}. Showing the last data${state.lastUpdated ? ` (updated ${state.lastUpdated.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })})` : ''}.`);
       if (!state.data) return;
     }
+    // an area that no longer has calls (all scheduled, or grouping changed) must not stay as a hidden filter
+    if (state.filters.area && !state.data.unscheduled.some((u) => u.area_key === state.filters.area)) state.filters.area = '';
     renderToolbar();
     if (!state.selectedId || detail) renderQueue();   // never re-render an open job card on background refresh
     renderMap(state.firstFit);
     state.firstFit = false;
+    if (state.view === 'areas') loadAreas({ quiet: true });
     if (!quiet && state.error) toast(state.error, 'error');
   }
 
@@ -57,6 +61,7 @@ export function mountDispatch(root, ctx) {
       if (f.trade && u.trade_code !== f.trade) return false;
       if (f.source && u.source_category !== f.source) return false;
       if (f.priority && u.priority_label !== f.priority) return false;
+      if (f.area && u.area_key !== f.area) return false;
       if (q) {
         const hay = `${u.customer_name} ${u.address} ${u.summary} ${u.zip} ${u.city} ${(u.warranty && u.warranty.dispatch_number) || ''}`.toLowerCase();
         if (!hay.includes(q)) return false;
@@ -107,6 +112,7 @@ export function mountDispatch(root, ctx) {
   function renderQueue() {
     const keep = queue.querySelector('.q-list'); const scroll = keep ? keep.scrollTop : 0;
     if (state.selectedId) { renderDetail(); return; }
+    if (state.view === 'areas') { renderAreas(); return; }
     const list = filtered();
     const trades = [...new Set(state.data.unscheduled.map((u) => u.trade_code).filter(Boolean))].sort();
     const sel = (key, label, opts) => h('select', { 'aria-label': label, onchange: (e) => { state.filters[key] = e.target.value; renderQueue(); renderMap(false); } },
@@ -115,23 +121,105 @@ export function mountDispatch(root, ctx) {
       oninput: (e) => { state.filters.q = e.target.value; clearTimeout(search._t); search._t = setTimeout(() => { renderQueue(); renderMap(false); search2Focus(); }, 180); } });
     const search2Focus = () => { const s = queue.querySelector('input[type=search]'); if (s) { s.focus(); s.setSelectionRange(s.value.length, s.value.length); } };
     const head = h('header', { class: 'q-head' },
+      viewTabs(),
       h('div', { class: 'q-title' }, h('h2', {}, 'Unscheduled'), h('span', { class: 'count' }, list.length === state.data.unscheduled.length ? `${list.length}` : `${list.length} of ${state.data.unscheduled.length}`)),
       search,
       h('div', { class: 'q-filters' },
         sel('trade', 'All trades', trades.map((t) => [t, t])),
         sel('source', 'All sources', Object.entries(SOURCE_LABEL)),
-        sel('priority', 'All priorities', ['Emergency', 'Expedited', 'Normal', 'Direct'].map((p) => [p, p]))));
+        sel('priority', 'All priorities', ['Emergency', 'Expedited', 'Normal', 'Direct'].map((p) => [p, p])),
+        sel('area', 'All areas', areaOptions())));
     const body = h('div', { class: 'q-list', role: 'list' },
       list.length ? list.map((u, i) => queueRow(u, i + 1)) : h('div', { class: 'empty' }, state.data.unscheduled.length ? 'No jobs match these filters.' : 'No unscheduled jobs. Nice work.'));
     render(queue, head, body);
     body.scrollTop = scroll;
   }
 
+  // Running total per area, straight from the queue the page already has (no extra request).
+  function areaOptions() {
+    const m = new Map();
+    for (const u of state.data.unscheduled) { const a = m.get(u.area_key) || { label: u.area, n: 0 }; a.n += 1; m.set(u.area_key, a); }
+    return [...m.entries()].sort((a, b) => b[1].n - a[1].n || a[1].label.localeCompare(b[1].label)).map(([k, a]) => [k, `${a.label} (${a.n})`]);
+  }
+  function viewTabs() {
+    const tab = (id, label, count) => h('button', {
+      class: `q-tab${state.view === id ? ' on' : ''}`, type: 'button', role: 'tab', 'aria-selected': String(state.view === id),
+      onclick: () => { if (state.view === id) return; state.view = id; if (id === 'areas') loadAreas(); renderQueue(); },
+    }, label, h('span', { class: 'count' }, count));
+    return h('div', { class: 'q-tabs', role: 'tablist', 'aria-label': 'Queue view' },
+      tab('queue', 'Queue', state.data.unscheduled.length), tab('areas', 'Areas', areaOptions().length));
+  }
+
+  // ------------------------------------------------------------------ areas
+  let areasSeq = 0;
+  async function loadAreas({ quiet = false } = {}) {
+    const seq = ++areasSeq;
+    state.areasLoading = true; state.areasError = null;
+    if (!quiet && !state.selectedId && state.view === 'areas') renderQueue();
+    try {
+      const r = await api.areas(state.areaDays);
+      if (seq !== areasSeq) return;
+      state.areas = r; if (state.areaDays == null) state.areaDays = r.days;
+    } catch (e) { if (seq !== areasSeq) return; state.areasError = e.message; }
+    state.areasLoading = false;
+    if (!state.selectedId && state.view === 'areas') renderQueue();
+  }
+  const isoPlusDays = (iso, n) => { const d = new Date(iso + 'T12:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
+  const dayWord = (date, today) => (date === today ? 'Today' : date === isoPlusDays(today, 1) ? 'Tomorrow' : fmtDay(date));
+
+  function renderAreas() {
+    const a = state.areas;
+    const scroll = (queue.querySelector('.q-list') || { scrollTop: 0 }).scrollTop;
+    const daysSel = h('select', { 'aria-label': 'Days to look ahead', onchange: (e) => { state.areaDays = Number(e.target.value); loadAreas(); } },
+      [1, 2, 3, 5, 7, 14].map((n) => h('option', { value: n, selected: n === (state.areaDays ?? (a ? a.days : 3)) }, `${n} day${n === 1 ? '' : 's'}`)));
+    const active = state.filters.area && (a ? a.areas.find((x) => x.key === state.filters.area) : null);
+    const head = h('header', { class: 'q-head' }, viewTabs(),
+      h('div', { class: 'q-title' }, h('h2', {}, 'Calls by area'),
+        h('span', { class: 'count' }, a ? `${a.totals.unscheduled} calls · ${a.totals.areas} area${a.totals.areas === 1 ? '' : 's'}` : '')),
+      h('div', { class: 'q-filters ar-ctl' },
+        h('label', { class: 'dim' }, 'Openings in the next ', daysSel),
+        h('button', { class: 'btn icon', type: 'button', title: 'Refresh', 'aria-label': 'Refresh areas', onclick: () => loadAreas() }, icon('refresh', 14)),
+        active ? h('button', { class: 'btn', type: 'button', onclick: () => { state.filters.area = ''; renderQueue(); renderMap(false); } }, icon('x', 12), ` Showing ${active.label}`) : null));
+    let body;
+    if (!a) body = h('div', { class: 'empty' }, state.areasError ? h('span', {}, icon('alert', 14), ' ', state.areasError) : 'Loading…');
+    else if (!a.areas.length) body = h('div', { class: 'empty' }, 'No unscheduled calls. Nice work.');
+    else body = h('div', { class: 'q-list ar-list', role: 'list' },
+      state.areasError ? h('div', { class: 'alert warn' }, icon('alert', 14), ` ${state.areasError}. Showing the last numbers.`) : null,
+      a.notes.map((n) => h('div', { class: 'alert warn' }, icon('alert', 14), ' ', n)),
+      h('p', { class: 'dim hint ar-hint' }, 'Each call is checked on its own against technician skills, shifts and today’s routes, so openings show where someone can go soonest, not a booking plan. Tap an area to see just those calls.'),
+      a.areas.map((x) => areaCard(x, a)));
+    render(queue, head, body);
+    const list = queue.querySelector('.q-list'); if (list) list.scrollTop = scroll;
+  }
+  function areaCard(x, a) {
+    const open = () => { state.filters.area = x.key; state.view = 'queue'; renderQueue(); renderMap(false); };
+    const when = (t) => `${dayWord(t.date, a.today)} · ${fmtMinutes(t.start_min)}`;
+    const chips = [];
+    if (x.overdue) chips.push(h('span', { class: 'chip dl-overdue', title: 'Past the deadline window' }, `${x.overdue} overdue`));
+    if (x.due_soon) chips.push(h('span', { class: 'chip dl-warning', title: 'Deadline window is closing' }, `${x.due_soon} due soon`));
+    if (x.excused) chips.push(h('span', { class: 'chip dl-excused', title: 'Marked as scheduled outside the deadline window' }, `${x.excused} outside window`));
+    for (const [trade, n] of Object.entries(x.by_trade).sort()) chips.push(badge(`${trade} ${n}`, 'trade'));
+    if (x.unlocated) chips.push(h('span', { class: 'chip warn', title: 'No map location, so openings cannot be checked for these' }, icon('mapoff', 12), ` ${x.unlocated} no location`));
+    const checkable = x.count - x.unlocated;
+    const e = x.earliest;
+    const soon = e && e.date <= isoPlusDays(a.today, 1);
+    const avail = e
+      ? h('div', { class: `ar-open${soon ? ' soon' : ''}` }, icon('clock', 13), ' Earliest opening ', h('b', {}, when(e)))
+      : h('div', { class: 'ar-open none' }, checkable ? `No technician has an opening in the next ${a.days} day${a.days === 1 ? '' : 's'}` : 'No map location, so openings cannot be checked');
+    const techs = x.techs.length ? h('ul', { class: 'ar-techs' }, x.techs.map((t) => h('li', { style: { '--c': t.color } },
+      h('span', { class: 'dot' }), h('b', {}, t.name), ` ${when(t)}`,
+      h('span', { class: 'dim' }, ` · can take ${t.eligible_jobs} of ${checkable}${t.added_drive_min ? `, +${Math.round(t.added_drive_min)} min driving` : ''}`)))) : null;
+    return h('div', { class: `ar-card${state.filters.area === x.key ? ' sel' : ''}`, role: 'listitem', tabindex: '0', title: 'Show only these calls in the queue and on the map', onclick: open, onkeydown: onEnter(open) },
+      h('div', { class: 'ar-top' }, h('span', { class: 'ar-name' }, x.label), h('span', { class: 'ar-count' }, h('b', {}, x.count), x.count === 1 ? ' call' : ' calls')),
+      h('div', { class: 'q-chips' }, chips), avail, techs);
+  }
+
   function badge(text, cls = '', title = '') { return h('span', { class: `badge ${cls}`, title }, text); }
   function chips(u) {
     const out = [badge(SOURCE_LABEL[u.source_category] || u.source_category, `src src-${u.source_category}`)];
     if (u.trade_code) out.push(badge(u.trade_code, 'trade'));
-    if (u.deadline_status !== 'none') out.push(h('span', { class: `chip dl-${u.deadline_status}`, title: 'Time left until the contact/schedule deadline (Admin > Settings)' }, icon('clock', 12), ' ', fmtLeft(u.deadline_hours_left)));
+    if (u.deadline_status === 'excused') out.push(h('span', { class: 'chip dl-excused', title: `Scheduling outside the deadline window: ${u.exception_label}` }, icon('clock', 12), ' outside window'));
+    else if (u.deadline_status !== 'none') out.push(h('span', { class: `chip dl-${u.deadline_status}`, title: 'Time left until the contact/schedule deadline (Admin > Settings). A target, not a hard limit.' }, icon('clock', 12), ' ', fmtLeft(u.deadline_hours_left)));
     if (u.age_hours != null) out.push(h('span', { class: 'chip dim', title: 'Time since the job arrived in Housecall Pro' }, `waiting ${fmtAge(u.age_hours)}`));
     if (u.urgency_flags.length) out.push(h('span', { class: 'chip urgent', title: 'Urgency keywords found in the problem text' }, icon('droplet', 12), ' ', u.urgency_flags.slice(0, 2).join(', ')));
     if (u.warranty && u.warranty.do_not_collect_service_fee) out.push(h('span', { class: 'chip fee', title: 'Warranty notice: do not collect the trade service fee' }, 'no fee'));
@@ -192,9 +280,11 @@ export function mountDispatch(root, ctx) {
     if (w && w.authorization_required) alerts.push(h('div', { class: 'alert warn' }, icon('alert', 14), ' Authorization is required before work starts.'));
     if (d.lat == null) alerts.push(h('div', { class: 'alert warn' }, icon('mapoff', 14), ` No map location (${d.geocode_status}). Check the address in Housecall Pro; slots cannot be computed without one.`));
 
-    const dl = sc.deadline_status !== 'none'
-      ? h('div', { class: `d-deadline dl-${sc.deadline_status}` }, icon('clock', 14), ` Deadline ${fmtDateTime(sc.deadline_at)} · `, h('b', {}, fmtLeft(sc.deadline_hours_left)))
-      : h('div', { class: 'd-deadline dim' }, 'No deadline rule for this job type (Admin > Settings).');
+    const dl = sc.deadline_status === 'excused'
+      ? h('div', { class: 'd-deadline dl-excused' }, icon('clock', 14), ' Outside the window · ', h('b', {}, sc.exception.reason_label))
+      : sc.deadline_status !== 'none'
+        ? h('div', { class: `d-deadline dl-${sc.deadline_status}` }, icon('clock', 14), ` Target ${fmtDateTime(sc.deadline_at)} · `, h('b', {}, fmtLeft(sc.deadline_hours_left)))
+        : h('div', { class: 'd-deadline dim' }, 'No deadline clock for this job type (Admin > Settings).');
     const scoreCard = h('div', { class: 'd-score' }, h('div', { class: 'big' }, Math.round(sc.total), h('small', {}, 'priority score')), dl);
 
     // --- slot finder
@@ -234,7 +324,41 @@ export function mountDispatch(root, ctx) {
 
     const raw = h('details', { class: 'd-sec raw' }, h('summary', {}, 'Original description from Housecall Pro'), h('pre', {}, d.description_raw || '(empty)'));
 
-    render(queue, hdr, h('div', { class: 'd-body' }, alerts, scoreCard, slotPanel, section('Problem', items), contact, warranty, breakdown, warnings, raw));
+    render(queue, hdr, h('div', { class: 'd-body' }, alerts, scoreCard, exceptionPanel(d), slotPanel, section('Problem', items), contact, warranty, breakdown, warnings, raw));
+  }
+
+  // ------------------------------------------------- scheduled outside the window
+  // The deadline is a target. A dispatcher records why a job is being booked later (customer not available, ...):
+  // it stops counting as overdue and slots are no longer ranked against the deadline. Saved in this app only.
+  function exceptionPanel(d) {
+    const sc = d.score, ex = sc.exception;
+    if (d.work_status !== 'unscheduled' || (sc.deadline_status === 'none' && !ex)) return null;
+    const reason = h('select', { 'aria-label': 'Reason' }, h('option', { value: '' }, 'Why is it outside the window?'),
+      (config.exception_reasons || []).map((r) => h('option', { value: r.code, selected: !!ex && ex.reason === r.code }, r.label)));
+    const note = h('input', { type: 'text', maxlength: 300, placeholder: 'Note (required for “Other”)', 'aria-label': 'Note', value: ex ? ex.note : '' });
+    const st = h('span', { class: 'f-status', role: 'status' });
+    const fail = (msg) => { st.textContent = msg; st.className = 'f-status bad'; };
+    const save = h('button', { class: 'btn primary', type: 'submit' }, ex ? 'Update' : 'Save');
+    const form = h('form', { class: 'exc-form', onsubmit: async (e) => {
+      e.preventDefault();
+      if (!reason.value) return fail('Choose a reason.');
+      save.disabled = true;
+      try { await api.setException(d.id, { reason: reason.value, note: note.value }); toast('Marked as scheduled outside the window', 'ok'); await refreshJob(d.id); }
+      catch (err) { fail(err.message); save.disabled = false; }
+    } }, reason, note, h('div', { class: 'exc-actions' }, save,
+      ex ? h('button', { class: 'btn', type: 'button', onclick: async () => {
+        try { await api.clearException(d.id); toast('Back on the normal deadline', 'ok'); await refreshJob(d.id); } catch (err) { fail(err.message); }
+      } }, 'Remove') : null, st));
+    const intro = ex
+      ? h('p', { class: 'plain' }, h('b', {}, ex.reason_label), ex.note ? ` – ${ex.note}` : '', h('span', { class: 'dim' }, ` · marked ${ex.set_by ? `by ${ex.set_by} ` : ''}${fmtDateTime(ex.set_at)}`))
+      : h('p', { class: 'dim hint' }, 'The deadline is a target, not a hard limit. If the customer isn’t available, or there’s another reason to book later, record it here: the job stops counting as overdue and slots are no longer ranked against the deadline. Saved in this app only; nothing is written to Housecall Pro.');
+    return h('details', { class: 'd-sec exc', open: !!ex }, h('summary', {}, ex ? 'Scheduled outside the window' : 'Scheduling this outside the window?'), intro, form);
+  }
+  async function refreshJob(id) {
+    try { state.detail = await api.job(id); } catch (e) { toast(e.message, 'error'); }
+    state.slots = null; state.slotsFor = null; state.hoverOpt = state.pinnedOpt = null;   // ranking depends on the exception
+    await load({ quiet: true, detail: true });                                              // queue chips, pins, stats, card
+    if (state.areas) loadAreas({ quiet: true });
   }
 
   // ----------------------------------------------------------------- slots UI
@@ -268,7 +392,7 @@ export function mountDispatch(root, ctx) {
     h('div', { class: 'slot-top' }, h('span', { class: 'dot' }), h('b', {}, o.tech_name), h('span', { class: 'slot-when' }, `${fmtDay(o.date)} · ${fmtMinutes(o.start_min)} – ${fmtMinutes(o.end_min)}`), i === 0 ? badge('best', 'best') : null),
     h('div', { class: 'slot-meta' }, `Stop ${o.position} of ${o.stops_in_day + 1} · `, h('b', {}, `+${Math.round(o.added_drive_min)} min driving`),
       ` · ${Math.round(o.drive_in_min)} min to get there${o.before_stop_id ? `, ${Math.round(o.drive_out_min)} min to next stop` : ''}`),
-    o.misses_deadline ? h('div', { class: 'slot-warn' }, icon('alert', 12), ' Finishes after the deadline') : null,
+    o.misses_deadline ? h('div', { class: 'slot-warn' }, icon('alert', 12), ' Falls outside the scheduling window') : null,
     o.date !== state.date ? h('div', { class: 'slot-hint dim' }, 'Click to view this day on the map') : null);
   }
 
@@ -291,7 +415,7 @@ export function mountDispatch(root, ctx) {
     el.addEventListener('click', open); el.addEventListener('keydown', onEnter(open));
     el.addEventListener('mouseenter', () => { const row = queue.querySelector(`.q-row[data-id="${CSS.escape(u.id)}"]`); if (row) { row.classList.add('hl'); row.scrollIntoView({ block: 'nearest' }); } });
     el.addEventListener('mouseleave', () => { const row = queue.querySelector(`.q-row[data-id="${CSS.escape(u.id)}"]`); if (row) row.classList.remove('hl'); });
-    map.tip(el, [`${rank}. ${u.priority_label} · ${u.customer_name || 'Unknown'}`, u.address, u.summary, `${SOURCE_LABEL[u.source_category]}${u.trade_code ? ' · ' + u.trade_code : ''} · score ${Math.round(u.score)}${u.deadline_status !== 'none' ? ' · ' + fmtLeft(u.deadline_hours_left) : ''}`].filter(Boolean));
+    map.tip(el, [`${rank}. ${u.priority_label} · ${u.customer_name || 'Unknown'}`, u.address, u.summary, `${SOURCE_LABEL[u.source_category]}${u.trade_code ? ' · ' + u.trade_code : ''} · score ${Math.round(u.score)}${u.deadline_status === 'excused' ? ' · outside window' : u.deadline_status !== 'none' ? ' · ' + fmtLeft(u.deadline_hours_left) : ''}`].filter(Boolean));
     return el;
   }
   function makeStop(s, t) {
@@ -356,7 +480,7 @@ function buildLegend() {
   const el = h('details', { class: 'dp-legend' }, h('summary', {}, 'Legend'),
     h('div', { class: 'lg-row' }, h('b', {}, 'Shape'), shape('ahs', 'AHS'), shape('other', 'Other warranty'), shape('direct', 'Direct lead')),
     h('div', { class: 'lg-row' }, h('b', {}, 'Color'), dot('prio-emergency', 'Emergency'), dot('prio-expedited', 'Expedited'), dot('prio-normal', 'Normal'), dot('prio-direct', 'Direct')),
-    h('div', { class: 'lg-row' }, h('b', {}, 'Ring'), dot('ring-warning', 'deadline closing'), dot('ring-critical', 'critical'), dot('ring-overdue', 'overdue')),
+    h('div', { class: 'lg-row' }, h('b', {}, 'Ring'), dot('ring-warning', 'window closing'), dot('ring-critical', 'critical'), dot('ring-overdue', 'overdue'), h('span', { class: 'dim' }, '(none = outside window or no deadline)')),
     h('div', { class: 'lg-row dim' }, 'Numbers = queue rank · water drop = urgency keyword · colored circles = scheduled stops by technician'));
   return el;
 }

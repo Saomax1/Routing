@@ -4,6 +4,7 @@ import unittest
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+from app.domain.areas import area_of
 from app.domain.durations import DEFAULT_DURATIONS, estimate_minutes
 from app.domain.scoring import score_job
 from app.domain.slots import find_best_slots
@@ -38,17 +39,49 @@ class ScoringTests(unittest.TestCase):
     def labels(self, res):
         return {b["label"]: b["points"] for b in res["breakdown"]}
 
-    def test_emergency_close_to_deadline(self):
+    def test_emergency_has_no_deadline_clock(self):
         res = score_job(self.job(3), self.warranty("Emergency", [{"name": "Water Leak", "problem": "secondary damage"}]),
                         SETTINGS, self.NOW)
         lab = self.labels(res)
         self.assertEqual(lab["Priority: Emergency"], 100)
-        self.assertEqual(res["deadline_status"], "critical")       # 1h of a 4h window left = 25%
-        self.assertEqual(lab["Deadline critical"], 30)
+        self.assertEqual(res["deadline_status"], "none")           # the old 4 h AHS Emergency rule is gone
+        self.assertIsNone(res["deadline_at"])
+        self.assertIsNone(res["deadline_hours_left"])
+        self.assertFalse(any(k.startswith("Deadline") for k in lab))
         self.assertEqual(lab["Urgency: secondary damage, leak"] if "Urgency: secondary damage, leak" in lab
                          else lab["Urgency: leak, secondary damage"], 20)
         self.assertEqual(res["priority_label"], "Emergency")
-        self.assertAlmostEqual(res["deadline_hours_left"], 1.0, places=1)
+
+    def test_expedited_close_to_deadline(self):
+        res = score_job(self.job(18), self.warranty("Expedited"), SETTINGS, self.NOW)
+        self.assertEqual(res["deadline_status"], "critical")       # 6h of a 24h window left = 25%
+        self.assertEqual(self.labels(res)["Deadline critical"], 30)
+        self.assertAlmostEqual(res["deadline_hours_left"], 6.0, places=1)
+
+    def test_normal_window_is_48_hours(self):
+        for category in ("ahs", "other_warranty"):
+            for hours_ago, status, left in ((10, "ok", 38), (30, "warning", 18), (46, "critical", 2), (49, "overdue", -1)):
+                res = score_job(self.job(hours_ago, category), self.warranty("Normal"), SETTINGS, self.NOW)
+                self.assertEqual(res["deadline_status"], status, (category, hours_ago))
+                self.assertAlmostEqual(res["deadline_hours_left"], left, places=1)
+
+    def test_exception_excuses_the_deadline(self):
+        exc = {"reason": "customer_unavailable", "reason_label": "Customer not available", "note": "back Monday"}
+        plain = score_job(self.job(100), self.warranty("Normal"), SETTINGS, self.NOW)
+        excused = score_job(self.job(100), self.warranty("Normal"), SETTINGS, self.NOW, exc)
+        self.assertEqual(plain["deadline_status"], "overdue")
+        self.assertEqual(excused["deadline_status"], "excused")
+        self.assertNotIn("Deadline overdue", self.labels(excused))
+        self.assertEqual(round(plain["total"] - excused["total"], 1), 40)       # exactly the overdue points
+        self.assertLess(excused["deadline_hours_left"], 0)                       # still reported for reference
+        self.assertTrue(excused["deadline_at"])
+        self.assertEqual(excused["exception"], exc)
+        self.assertTrue(any("Customer not available" in b["label"] for b in excused["breakdown"]))
+
+    def test_exception_on_a_job_with_no_deadline_rule_changes_nothing(self):
+        exc = {"reason": "other", "reason_label": "Other", "note": "x"}
+        res = score_job(self.job(3), self.warranty("Emergency"), SETTINGS, self.NOW, exc)
+        self.assertEqual(res["deadline_status"], "none")
 
     def test_normal_fresh_job_has_no_deadline_points(self):
         res = score_job(self.job(1), self.warranty("Normal"), SETTINGS, self.NOW)
@@ -57,7 +90,7 @@ class ScoringTests(unittest.TestCase):
         self.assertLess(res["total"], 25)
 
     def test_overdue(self):
-        res = score_job(self.job(100), self.warranty("Normal"), SETTINGS, self.NOW)   # 72h window
+        res = score_job(self.job(100), self.warranty("Normal"), SETTINGS, self.NOW)   # 48h window
         self.assertEqual(res["deadline_status"], "overdue")
         self.assertLess(res["deadline_hours_left"], 0)
         self.assertEqual(self.labels(res)["Deadline overdue"], 40)
@@ -261,8 +294,31 @@ class SlotTests(unittest.TestCase):
         res = self.run_slots([tech(home=(0, 0))], {}, days=[self.THU, self.FRI], deadline=deadline)
         self.assertTrue(res["options"])
         self.assertFalse(any(o["misses_deadline"] for o in res["options"]))
-        self.assertTrue(any("already passed" in n for n in res["notes"]))
+        self.assertTrue(any("past its scheduling window" in n for n in res["notes"]))
         self.assertEqual(res["options"][0]["date"], self.THU.isoformat())   # still prefers the soonest slot
+
+    def test_soonest_mode_ranks_by_start_time_not_drive_cost(self):
+        # t1 sits right at the job but is busy until 12:00; t2 is free but 50 min away (earliest 08:50).
+        sched = {("t1", self.THU): [stop("A", 0, 20, 8, 0, 240)]}
+        techs = [tech("t1", home=(0, 20)), tech("t2", home=(0, 70))]
+        cheapest = self.run_slots(techs, sched)
+        soonest = find_best_slots({"id": "NEW", "lat": 0, "lng": 20, "trade_code": "PLB"}, techs, sched, GridTravel(),
+                                  SETTINGS, self.NOW, [self.THU], 60, TZ, soonest=True)
+        self.assertEqual(cheapest["options"][0]["tech_id"], "t1")          # zero extra driving wins by default
+        self.assertEqual(soonest["options"][0]["tech_id"], "t2")           # but t2 can be there first
+        self.assertEqual(soonest["options"][0]["start_min"], 8 * 60 + 50)
+        self.assertEqual([o["tech_id"] for o in soonest["options"]], ["t2", "t1"])
+
+    def test_soonest_mode_prefers_an_earlier_day_over_a_closer_gap(self):
+        res = find_best_slots({"id": "NEW", "lat": 0, "lng": 20, "trade_code": "PLB"}, [tech(home=(0, 0))], {},
+                              GridTravel(), SETTINGS, self.NOW, [self.THU, self.FRI], 60, TZ, soonest=True)
+        self.assertEqual([o["date"] for o in res["options"]], [self.THU.isoformat(), self.FRI.isoformat()])
+
+    def test_limit_overrides_top_n(self):
+        techs = [tech(f"t{i}", home=(0, i)) for i in range(8)]
+        res = find_best_slots({"id": "NEW", "lat": 0, "lng": 20, "trade_code": "PLB"}, techs, {}, GridTravel(),
+                              SETTINGS, self.NOW, [self.THU, self.FRI], 60, TZ, soonest=True, limit=100)
+        self.assertEqual(len(res["options"]), 16)                          # one per tech per day, not capped at 5
 
     def test_job_without_location(self):
         res = self.run_slots([tech()], {}, job={"id": "NEW", "lat": None, "lng": None, "trade_code": "PLB"})
@@ -285,6 +341,21 @@ class SlotTests(unittest.TestCase):
         self.assertEqual(sched, before)
 
 
+class AreaTests(unittest.TestCase):
+    def test_city_grouping_is_case_and_spacing_insensitive(self):
+        a = area_of({"city": "  CHANDLER ", "zip": "85226"})
+        self.assertEqual(a, area_of({"city": "chandler", "zip": "85225"}))
+        self.assertEqual(a, ("city:chandler", "Chandler"))
+        self.assertEqual(area_of({"city": "McKinney"})[1], "McKinney")           # mixed case is left alone
+
+    def test_zip_grouping_and_fallbacks(self):
+        self.assertEqual(area_of({"city": "Mesa", "zip": "85201-1234"}, "zip"), ("zip:85201", "ZIP 85201"))
+        self.assertEqual(area_of({"city": "Mesa", "zip": ""}, "zip"), ("city:mesa", "Mesa"))      # no zip: use city
+        self.assertEqual(area_of({"city": "", "zip": "85201"}, "city"), ("zip:85201", "ZIP 85201"))  # no city: use zip
+        self.assertEqual(area_of({"city": "", "zip": "abc"}), ("none", "No address"))
+        self.assertEqual(area_of({}), ("none", "No address"))
+
+
 class MiscTests(unittest.TestCase):
     def test_iso_roundtrip_and_ceil(self):
         dt = parse_iso("2026-10-01T15:30:00Z")
@@ -294,11 +365,19 @@ class MiscTests(unittest.TestCase):
         self.assertEqual(ceil_to(481, 5), 485)
         self.assertEqual(ceil_to(480, 5), 480)
 
+    def test_default_deadline_rules(self):
+        rules = DEFAULT_SETTINGS["deadline_rules"]
+        self.assertNotIn("Emergency", rules["AHS"])                 # AHS Emergency has no deadline clock
+        self.assertEqual(rules["AHS"]["Normal"], 48)
+        self.assertEqual(rules["OTHER_WARRANTY"]["Normal"], 48)
+        self.assertEqual(DEFAULT_SETTINGS["areas"]["group_by"], "city")
+
     def test_settings_validation(self):
         validate_settings({"scoring": {"base_direct_lead": 40}})
+        validate_settings({"areas": {"group_by": "zip"}})
         for bad in ({"scoring": {"base_direct_lead": "x"}}, {"nope": 1}, {"timezone": "Mars/Base"},
                     {"deadline_rules": {"AHS": {"Normal": -1}}}, {"map": {"tile_url": "http://insecure/{z}/{x}/{y}"}},
-                    {"deadline_rules": {"AHS": 5}}):
+                    {"deadline_rules": {"AHS": 5}}, {"areas": {"group_by": "county"}}, {"areas": {"nope": 1}}):
             with self.assertRaises(ValueError, msg=str(bad)):
                 validate_settings(bad)
 

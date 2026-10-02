@@ -64,9 +64,11 @@ class AuthTests(ApiBase):
     def test_protected_routes_require_login(self):
         c = Client(self.app)
         for path in ("/api/dispatch", "/api/jobs/x", "/api/technicians", "/api/settings", "/api/sync/status",
-                     "/api/auth/me", "/api/config", "/api/users", "/api/parse-review"):
+                     "/api/auth/me", "/api/config", "/api/users", "/api/parse-review", "/api/areas"):
             self.assertEqual(c.get(path).status, 401, path)
         self.assertEqual(c.post("/api/sync/run").status, 401)
+        self.assertEqual(c.put("/api/jobs/x/exception", {"reason": "other", "note": "x"}).status, 401)
+        self.assertEqual(c.delete("/api/jobs/x/exception").status, 401)
 
     def test_csrf_header_required_for_mutations(self):
         c = Client(self.app, csrf=False)
@@ -180,6 +182,109 @@ class DispatchApiTests(ApiBase):
         self.assertEqual(r.status, 500)
         self.assertEqual(r.json(), {"error": "Internal error"})
         self.assertNotIn("secret", r.text)
+
+
+class ExceptionApiTests(ApiBase):
+    def overdue_id(self):
+        return next(u["id"] for u in self.disp.get("/api/dispatch").json()["unscheduled"] if u["deadline_status"] == "overdue")
+
+    def test_config_lists_the_reasons(self):
+        reasons = self.disp.get("/api/config").json()["exception_reasons"]
+        codes = [r["code"] for r in reasons]
+        self.assertIn("customer_unavailable", codes)
+        self.assertIn("other", codes)
+        self.assertTrue(all(r["label"] for r in reasons))
+
+    def test_dispatcher_can_mark_and_clear_a_job(self):
+        jid = self.overdue_id()
+        before = self.disp.get("/api/dispatch").json()
+        r = self.disp.put(f"/api/jobs/{jid}/exception", {"reason": "customer_unavailable", "note": "away until the 12th"})
+        self.assertEqual(r.status, 200, r.text)
+        exc = r.json()["exception"]
+        self.assertEqual((exc["reason_label"], exc["note"], exc["set_by"]), ("Customer not available", "away until the 12th", "Dee"))
+        try:
+            d = self.disp.get(f"/api/jobs/{jid}").json()
+            self.assertEqual(d["score"]["deadline_status"], "excused")
+            self.assertEqual(d["score"]["exception"]["note"], "away until the 12th")
+            after = self.disp.get("/api/dispatch").json()
+            entry = next(u for u in after["unscheduled"] if u["id"] == jid)
+            self.assertEqual((entry["deadline_status"], entry["exception_label"]), ("excused", "Customer not available"))
+            self.assertNotIn("away until", str(after))                  # the note itself stays out of the queue payload
+            self.assertEqual(after["stats"]["overdue"], before["stats"]["overdue"] - 1)
+            slots = self.disp.post(f"/api/jobs/{jid}/slots", {"days": 5}).json()
+            self.assertTrue(any("outside the window" in n for n in slots["notes"]))
+        finally:
+            self.assertEqual(self.disp.delete(f"/api/jobs/{jid}/exception").status, 200)
+        self.assertEqual(self.disp.delete(f"/api/jobs/{jid}/exception").status, 404)
+        self.assertEqual(self.disp.get(f"/api/jobs/{jid}").json()["score"]["deadline_status"], "overdue")
+
+    def test_replacing_an_existing_mark(self):
+        jid = self.overdue_id()
+        try:
+            self.assertEqual(self.disp.put(f"/api/jobs/{jid}/exception", {"reason": "customer_unavailable"}).status, 200)
+            r = self.admin.put(f"/api/jobs/{jid}/exception", {"reason": "other", "note": "see office"})
+            self.assertEqual((r.status, r.json()["exception"]["reason"]), (200, "other"))
+        finally:
+            self.disp.delete(f"/api/jobs/{jid}/exception")
+
+    def test_validation(self):
+        jid = self.overdue_id()
+        for body in ({}, {"reason": "nope"}, {"reason": "other"}, {"reason": "other", "note": "  "},
+                     {"reason": "customer_unavailable", "note": "x" * 301}, {"reason": "customer_unavailable", "note": 5}):
+            self.assertEqual(self.disp.put(f"/api/jobs/{jid}/exception", body).status, 400, body)
+        sched = next(j for j in self.app.state.hcp.dataset["jobs"] if j["work_status"] == "scheduled")["id"]
+        self.assertEqual(self.disp.put(f"/api/jobs/{sched}/exception", {"reason": "customer_unavailable"}).status, 400)
+        self.assertEqual(self.disp.put("/api/jobs/nope/exception", {"reason": "customer_unavailable"}).status, 404)
+        self.assertEqual(self.disp.get(f"/api/jobs/{jid}").json()["score"]["deadline_status"], "overdue")   # nothing was saved
+
+    def test_csrf_header_is_required(self):
+        jid = self.overdue_id()
+        c = login(self.app, DISPATCH)
+        r = c.put(f"/api/jobs/{jid}/exception", {"reason": "customer_unavailable"}, csrf=False)
+        self.assertEqual(r.status, 403)
+        self.assertEqual(c.delete(f"/api/jobs/{jid}/exception", csrf=False).status, 403)
+
+
+class AreasApiTests(ApiBase):
+    def test_areas_shape_and_totals(self):
+        r = self.disp.get("/api/areas")
+        self.assertEqual(r.status, 200, r.text)
+        res = r.json()
+        queue = self.disp.get("/api/dispatch").json()["unscheduled"]
+        self.assertEqual(res["totals"]["unscheduled"], len(queue))
+        self.assertEqual(sum(a["count"] for a in res["areas"]), len(queue))
+        a = res["areas"][0]
+        for k in ("key", "label", "count", "by_trade", "overdue", "due_soon", "excused", "unlocated", "earliest", "techs"):
+            self.assertIn(k, a)
+        self.assertNotIn("tel:", r.text)
+        self.assertNotIn("_techs", r.text)
+        # every queue entry carries the key the Areas tab and the queue filter use
+        self.assertTrue({u["area_key"] for u in queue} <= {x["key"] for x in res["areas"]})
+
+    def test_days_parameter(self):
+        self.assertEqual(self.disp.get("/api/areas?days=7").json()["days"], 7)
+        for bad in ("0", "15", "x", "-1", "2.5"):
+            self.assertEqual(self.disp.get(f"/api/areas?days={bad}").status, 400, bad)
+
+    def test_admin_can_switch_grouping_to_zip(self):
+        try:
+            self.assertEqual(self.admin.put("/api/settings", {"settings": {"areas": {"group_by": "zip"}}}).status, 200)
+            res = self.disp.get("/api/areas").json()
+            self.assertEqual(res["group_by"], "zip")
+            self.assertTrue(any(a["key"].startswith("zip:") for a in res["areas"]))
+            self.assertEqual(self.admin.put("/api/settings", {"settings": {"areas": {"group_by": "county"}}}).status, 400)
+        finally:
+            self.admin.put("/api/settings", {"settings": {"areas": {"group_by": "city"}}})
+        self.assertEqual(self.disp.get("/api/areas").json()["group_by"], "city")
+
+    def test_removed_deadline_rules_stay_removed(self):
+        before = self.admin.get("/api/settings").json()["settings"]["deadline_rules"]
+        try:
+            slim = {"AHS": {"Normal": 48}}
+            self.assertEqual(self.admin.put("/api/settings", {"settings": {"deadline_rules": slim}}).status, 200)
+            self.assertEqual(self.admin.get("/api/settings").json()["settings"]["deadline_rules"], slim)
+        finally:
+            self.admin.put("/api/settings", {"settings": {"deadline_rules": before}})
 
 
 class AdminApiTests(ApiBase):

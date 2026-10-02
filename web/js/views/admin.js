@@ -142,8 +142,12 @@ export function mountSettings(root, ctx) {
       const sec = (title, ...k) => h('section', { class: 'card' }, h('h2', {}, title), ...k);
       render(page, h('h1', {}, 'Settings'),
         h('form', { class: 'settings', onsubmit: save },
-          sec('Deadline rules', h('div', { class: 'alert warn' }, icon('alert', 14), ' These are placeholder values. Replace them with the real contact/schedule deadlines from your warranty vendor agreements; the deadline warnings and scoring depend on them.'),
-            note('Hours from when a job arrives in Housecall Pro until it should be scheduled. Source keys: AHS, OTHER_WARRANTY, DIRECT. Priorities: Emergency, Expedited, Normal.'), deadlineEditor()),
+          sec('Deadline rules', h('div', { class: 'alert info' }, icon('clock', 14), ' Deadlines are targets, not hard limits. Normal warranty calls are 48 hours. A dispatcher can book a job later and record why (customer not available, etc.) on its job card; that job then stops counting as overdue.'),
+            note('Hours from when a job arrives in Housecall Pro until it should be scheduled. Source keys: AHS, OTHER_WARRANTY, DIRECT. Priorities: Emergency, Expedited, Normal. A priority with no row has no deadline clock and is ranked by its base score alone (AHS Emergency has none). The Expedited and Direct hours are still placeholders: confirm them against your vendor agreements.'), deadlineEditor()),
+          sec('Areas', h('div', { class: 'grid' }, field('Group calls by',
+            h('select', { onchange: (e) => setPath(draft, 'areas.group_by', e.target.value) },
+              [['city', 'City'], ['zip', 'ZIP code']].map(([v, t]) => h('option', { value: v, selected: getPath(draft, 'areas.group_by') === v }, t))),
+            'Used for the running totals on the Dispatch > Areas tab and the "All areas" filter.'))),
           sec('Priority score', h('div', { class: 'grid' },
             num('scoring.base_by_priority.Emergency', 'Base: Emergency'), num('scoring.base_by_priority.Expedited', 'Base: Expedited'), num('scoring.base_by_priority.Normal', 'Base: Normal'),
             num('scoring.base_direct_lead', 'Base: direct lead'), num('scoring.base_other_warranty', 'Base: other warranty'),
@@ -218,7 +222,7 @@ export function mountUsers(root, ctx) {
         e.preventDefault();
         try { await api.createUser({ email: email.value, name: name.value, password: pw.value, role: role.value }); toast('User created', 'ok'); load(); } catch (err) { toast(err.message, 'error', 6000); }
       } }, h('h2', {}, 'Add a user'), h('div', { class: 'grid' }, field('Email', email), field('Name', name), field('Password (10+ characters)', pw), field('Role', role)), h('button', { class: 'btn primary', type: 'submit' }, 'Create user'));
-      render(page, h('h1', {}, 'Users'), note('Dispatchers can view the map, job cards and slot suggestions and run syncs. Admins can also change technicians, settings and users.'),
+      render(page, h('h1', {}, 'Users'), note('Dispatchers can view the map, areas, job cards and slot suggestions, run syncs, and mark a job as scheduled outside its deadline window. Admins can also change technicians, settings and users.'),
         h('section', { class: 'card' }, h('table', { class: 'tbl' }, h('thead', {}, h('tr', {}, h('th', {}, 'Email'), h('th', {}, 'Name'), h('th', {}, 'Role'), h('th'))),
           h('tbody', {}, users.map((u) => h('tr', {}, h('td', {}, u.email), h('td', {}, u.name), h('td', {}, h('span', { class: `chip ${u.role === 'admin' ? 'ok' : 'dim'}` }, u.role)),
             h('td', {}, u.id === ctx.user.id ? h('span', { class: 'dim' }, 'you') : h('button', { class: 'btn', type: 'button', onclick: async () => { if (!confirm(`Delete ${u.email}?`)) return; try { await api.deleteUser(u.id); load(); } catch (err) { toast(err.message, 'error'); } } }, 'Delete'))))))),

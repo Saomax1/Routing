@@ -32,8 +32,8 @@ touches real data).
 python -m unittest discover -s tests -t .
 ```
 
-114 tests cover the warranty parser, scoring, travel and slot engines, the sync pipeline and the API (auth, roles,
-CSRF, rate limiting). All fixtures are sanitized fake data. The suite uses only the standard library `unittest`.
+146 tests cover the warranty parser, scoring, travel and slot engines, deadline exceptions, area totals, the sync
+pipeline and the API (auth, roles, CSRF, rate limiting). All fixtures are sanitized fake data. The suite uses only the standard library `unittest`.
 
 ## Connecting to your real Housecall Pro account
 
@@ -59,7 +59,8 @@ auth header, `/jobs` and `/employees` paths, query parameter names, and where th
 5. **Set up technicians** under *Admin > Technicians*. New live technicians start with routing OFF until an admin sets
    their trade skills, home base, shift hours, work days and max jobs per day. Without that, they will never be
    suggested.
-6. **Replace the placeholder deadline rules** under *Admin > Settings* (see below).
+6. **Confirm the deadline rules** under *Admin > Settings*: Normal is 48 h and AHS Emergency has no clock; the
+   Expedited and Direct hours are still placeholders (see below).
 
 ## Environment variables
 
@@ -83,11 +84,24 @@ See [`.env.example`](.env.example) for the full annotated list. The important on
   header. Anything the regex cannot read is flagged in *Parse review*, where a dispatcher can fix it and mark it reviewed.
 - **Scoring** (`app/domain/scoring.py`): urgency = base by priority + points as the deadline approaches + urgency
   keywords + age. Every score shows its breakdown in the job card.
+- **Deadlines are targets, not hard limits.** Normal warranty calls have a 48 h window; AHS Emergency has no deadline
+  clock (it is ranked by its base score alone). When a customer is not available, or there is any other reason to book
+  later, a dispatcher opens the job card, chooses *Scheduling this outside the window?*, picks a reason and optionally
+  adds a note. That job then shows *outside window* instead of overdue, earns no deadline points and is no longer
+  penalized by the slot finder. It is saved in this app only (never written to Housecall Pro), records who marked it,
+  and survives syncs. *Remove* puts the job back on the normal deadline.
+- **Areas** (`Dispatch > Areas` tab, `GET /api/areas`): a running total of unscheduled calls per area (city by default,
+  or ZIP under *Admin > Settings > Areas*), with overdue / due-soon / trade counts and the soonest technician openings
+  in each area for the next 1-14 days, so you can see where it pays to send someone first. Each call is checked on its
+  own against skills, shifts and existing routes, so openings are a guide, not a booking plan (calls share the same
+  technicians). Click an area to filter the queue and map to it; the queue's *All areas* filter shows the same totals.
+  Calls with no map location are counted but cannot be checked for openings.
 - **Slot finder** (`app/domain/slots.py`): for each eligible technician and day, tries the job in every gap of the route
   (previous stop or home base -> new job -> next stop). Existing start times stay fixed. It checks skills, shift hours,
   work days, max jobs and same-day lead time, and ranks by added drive time plus a per-day delay penalty (so Emergency
-  jobs prefer today) plus a penalty for missing the deadline. If a job's deadline has already passed, options are ranked
-  by speed and cost and the card says so.
+  jobs prefer today) plus a penalty for finishing after the deadline (skipped for jobs marked outside the window). If a
+  job is already past its window, options are ranked by speed and cost and the card says so. The Areas tab runs the same
+  engine in a "soonest opening" mode.
 - **Map**: a small built-in slippy map. Pin shape = source (square AHS, diamond other warranty, circle direct), color =
   priority, ring = deadline status. The tile source is `map.tile_url` in Settings (OpenStreetMap by default; swap it for
   a commercial tile provider for heavier use).
@@ -109,14 +123,17 @@ See [`.env.example`](.env.example) for the full annotated list. The important on
 
 ## Known gaps
 
-- **Deadline rules are placeholders** (AHS Emergency 4h, Expedited 24h, Normal 72h; direct jobs 24h). Replace them with
-  the real numbers from your vendor agreements under *Admin > Settings* before relying on deadline warnings.
+- **Some deadline rules are still placeholders.** Normal warranty calls are 48 h and AHS Emergency has no clock, but
+  Expedited (24 h) and direct jobs (24 h) are guesses: confirm them under *Admin > Settings*. With no clock, an AHS
+  Emergency no longer picks up deadline points, so an overdue Expedited job can tie with a fresh Emergency in the
+  queue. Raise *Base: Emergency* under *Priority score* if you want Emergency to stay on top.
 - **Travel times are straight-line (Haversine) estimates**, not road routing. The `TravelTimeProvider` interface in
   `app/domain/travel.py` is where a routing API goes.
 - **Stack deviation:** the original plan assumed FastAPI + React + Leaflet. The build sandbox could not install packages
   from PyPI or npm, so this uses Starlette + stdlib `sqlite3` + plain ES modules + a built-in map. Everything is
   standard and can be moved to a bigger stack later; the pure engines in `app/domain/` do not depend on the web layer.
-- **Not built yet (Phase 2):** write-back to HCP, `/api/webhooks`, cluster suggestions UI, compliance tracker.
+- **Not built yet (Phase 2):** write-back to HCP, `/api/webhooks`, route-cluster suggestions beyond the Areas tab,
+  compliance tracker.
 - **Not built yet (Phase 3):** schedule optimization and reporting.
 - Map tiles load from the internet; in a locked-down network they will not, and the map shows a notice.
 

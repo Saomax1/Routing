@@ -83,6 +83,14 @@ CREATE TABLE IF NOT EXISTS warranty_details (
   parsed_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS job_exceptions (         -- dispatcher says: "scheduling this one outside its deadline window"
+  hcp_job_id TEXT PRIMARY KEY REFERENCES jobs(hcp_job_id) ON DELETE CASCADE,
+  reason TEXT NOT NULL,                             -- a code from services/job_exceptions.REASONS
+  note TEXT NOT NULL DEFAULT '',
+  set_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  set_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS job_durations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   trade_code TEXT NOT NULL DEFAULT '*',             -- '*' = any trade

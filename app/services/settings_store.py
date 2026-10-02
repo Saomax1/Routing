@@ -1,9 +1,11 @@
 """
 Admin-editable settings (stored as one JSON document in the ``settings`` table), with defaults.
 
-IMPORTANT: ``deadline_rules`` are PLACEHOLDERS. They control the deadline warnings and the
-urgency points in the priority score. Replace them with the real contact/schedule deadlines from
-your warranty vendor agreements (Admin > Settings) before relying on the warning colors.
+``deadline_rules`` control the deadline warnings and the urgency points in the priority score. They are
+TARGETS, not hard limits: a dispatcher can schedule a job outside its window and record why (see
+``services/job_exceptions.py``). A priority with no rule (AHS Emergency) simply has no deadline clock.
+Normal warranty calls are 48 h; the Expedited and Direct values are still placeholders - confirm them
+under Admin > Settings.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ import copy
 from typing import Any
 
 from ..db import jdump, jload
+from ..domain.areas import GROUP_BY
 from ..domain.durations import DEFAULT_DURATIONS
 
 SETTINGS_KEY = "app"
@@ -28,12 +31,15 @@ DEFAULT_SETTINGS: dict = {
         "age_points_cap": 30,
         "deadline_points": {"overdue": 40, "critical": 30, "warning": 15},
     },
-    # Hours from "received" until the job should be scheduled/contacted. PLACEHOLDERS - confirm!
+    # Hours from "received" until the job should be scheduled/contacted. A target, not a hard limit (jobs can be
+    # marked "scheduled outside the window"). AHS Emergency has no rule on purpose. Expedited/Direct: confirm!
     "deadline_rules": {
-        "AHS": {"Emergency": 4, "Expedited": 24, "Normal": 72},
-        "OTHER_WARRANTY": {"Normal": 72},
+        "AHS": {"Expedited": 24, "Normal": 48},
+        "OTHER_WARRANTY": {"Normal": 48},
         "DIRECT": {"Normal": 24},
     },
+    # How the running totals on the Areas tab group unscheduled calls: by "city" or by "zip" code.
+    "areas": {"group_by": "city"},
     "urgency_keywords": ["secondary damage", "leak", "flood", "no water", "no hot water",
                          "no heat", "no cooling", "no ac", "gas", "sewage", "backup", "burst"],
     "trade_aliases": {
@@ -64,6 +70,11 @@ DEFAULT_SETTINGS: dict = {
     # UNVERIFIED URL pattern - check a real HCP job link and adjust ({id} is replaced).
     "links": {"hcp_job_url_template": "https://pro.housecallpro.com/app/jobs/{id}"},
 }
+
+
+# Free-form maps that users add to and remove from. A saved copy replaces the default instead of merging into it,
+# otherwise a rule removed in Admin > Settings would come back from the defaults on the next read.
+FREE_FORM_MAPS = ("deadline_rules", "trade_aliases")
 
 
 def deep_merge(base: dict, patch: dict) -> dict:
@@ -113,6 +124,9 @@ def validate_settings(patch: dict) -> None:
             ZoneInfo(tz)
         except Exception:
             raise ValueError(f"Unknown timezone '{tz}'")
+    group_by = (patch.get("areas") or {}).get("group_by")
+    if group_by is not None and group_by not in GROUP_BY:
+        raise ValueError(f"Area grouping must be one of: {', '.join(GROUP_BY)}")
     tile = (patch.get("map") or {}).get("tile_url")
     if tile and not str(tile).startswith("https://"):
         raise ValueError("Map tile URL must start with https://")
@@ -130,7 +144,11 @@ def validate_settings(patch: dict) -> None:
 def get_settings(conn) -> dict:
     row = conn.execute("SELECT value FROM settings WHERE key = ?", (SETTINGS_KEY,)).fetchone()
     stored = jload(row["value"], {}) if row else {}
-    return deep_merge(DEFAULT_SETTINGS, stored)
+    merged = deep_merge(DEFAULT_SETTINGS, stored)
+    for key in FREE_FORM_MAPS:
+        if key in stored:
+            merged[key] = stored[key]
+    return merged
 
 
 def save_settings(conn, patch: dict) -> dict:
@@ -138,7 +156,7 @@ def save_settings(conn, patch: dict) -> dict:
     current = get_settings(conn)
     merged = deep_merge(current, patch)
     # replace (not merge) the free-form maps so removed companies/aliases actually disappear
-    for key in ("deadline_rules", "trade_aliases"):
+    for key in FREE_FORM_MAPS:
         if key in patch:
             merged[key] = patch[key]
     conn.execute("INSERT INTO settings(key, value) VALUES(?, ?) "

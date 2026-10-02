@@ -10,11 +10,13 @@ from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from ..db import jload
+from ..domain.areas import area_of
 from ..domain.durations import estimate_minutes
 from ..domain.scoring import score_job
 from ..domain.slots import Schedule, find_best_slots
 from ..domain.timeutil import at_local_minutes, minutes_of_day, parse_iso, to_iso
 from ..domain.travel import HaversineTravel
+from .job_exceptions import exception_map, get_exception
 from .settings_store import get_durations
 
 
@@ -81,11 +83,15 @@ def _tz(settings: dict) -> ZoneInfo:
 
 # -------------------------------------------------------------------- queue / map
 
-def unscheduled_entry(job: dict, warranty: Optional[dict], settings: dict, now: datetime) -> dict:
-    sc = score_job(job, warranty, settings, now)
+def unscheduled_entry(job: dict, warranty: Optional[dict], settings: dict, now: datetime,
+                      exception: Optional[dict] = None) -> dict:
+    sc = score_job(job, warranty, settings, now, exception)
+    area_key, area_label = area_of(job, settings["areas"]["group_by"])
     return {
         "id": job["hcp_job_id"], "customer_name": job["customer_name"], "address": address_line(job),
         "city": job["city"], "zip": job["zip"], "lat": job["lat"], "lng": job["lng"],
+        "area_key": area_key, "area": area_label,
+        "exception_label": exception["reason_label"] if exception else None,
         "geocode_status": job["geocode_status"], "trade_code": job["trade_code"],
         "source_category": job["source_category"], "lead_source": job["lead_source"],
         "priority_label": sc["priority_label"], "score": sc["total"], "deadline_status": sc["deadline_status"],
@@ -170,9 +176,10 @@ def build_dispatch(conn, d: date, settings: dict, now: datetime) -> dict:
             unassigned += [_stop(j, wmap.get(j["hcp_job_id"]), 0, tz, settings, durations) for j in jobs]
 
     uns = []
+    exceptions = exception_map(conn)
     for r in conn.execute("SELECT * FROM jobs WHERE active = 1 AND work_status = 'unscheduled'"):
         j = job_dict(r)
-        uns.append(unscheduled_entry(j, wmap.get(j["hcp_job_id"]), settings, now))
+        uns.append(unscheduled_entry(j, wmap.get(j["hcp_job_id"]), settings, now, exceptions.get(j["hcp_job_id"])))
     uns.sort(key=lambda u: (-u["score"], u["received_at"] or ""))
 
     last = conn.execute("SELECT * FROM sync_runs ORDER BY id DESC LIMIT 1").fetchone()
@@ -203,7 +210,7 @@ def build_job_detail(conn, job_id: str, settings: dict, now: datetime) -> Option
     wr = conn.execute("SELECT * FROM warranty_details WHERE hcp_job_id = ?", (job_id,)).fetchone()
     w = warranty_dict(wr)
     wd = (w or {}).get("data") or {}
-    sc = score_job(job, w, settings, now)
+    sc = score_job(job, w, settings, now, get_exception(conn, job_id))
     durations = get_durations(conn)
     names = {t["id"]: t["name"] for t in load_technicians(conn)}
     return {
@@ -277,12 +284,16 @@ def compute_slots(conn, job_id: str, settings: dict, now: datetime, search_days:
     w = wmap.get(job_id)
     duration = estimate_minutes(job["trade_code"], job_text(job, w), durations,
                                 settings["scheduling"]["default_duration_minutes"])
-    sc = score_job(job, w, settings, now)
+    sc = score_job(job, w, settings, now, get_exception(conn, job_id))
+    excused = sc["deadline_status"] == "excused"
     schedule, unlocated = build_schedule(conn, days, settings, durations, wmap)
     result = find_best_slots(
         {"id": job_id, "lat": job["lat"], "lng": job["lng"], "trade_code": job["trade_code"]},
         load_technicians(conn), schedule, HaversineTravel.from_settings(settings), settings, now, days, duration, tz,
-        priority_label=sc["priority_label"], deadline_at=parse_iso(sc["deadline_at"]))
+        priority_label=sc["priority_label"], deadline_at=None if excused else parse_iso(sc["deadline_at"]))
+    if excused:
+        result["notes"].append(f"Marked as scheduled outside the window ({sc['exception']['reason_label']}), "
+                               "so the deadline is not used to rank these options.")
     if unlocated:
         result["notes"].append(f"{unlocated} scheduled stop(s) have no map location, so drive time to/from them is "
                                "assumed to be zero.")
@@ -290,3 +301,83 @@ def compute_slots(conn, job_id: str, settings: dict, now: datetime, search_days:
                    "priority_label": sc["priority_label"], "deadline_at": sc["deadline_at"],
                    "travel_model": "straight-line distance estimate (swap in Google/Mapbox for road times)"})
     return result
+
+
+# ------------------------------------------------------------------------- areas
+
+def build_areas(conn, settings: dict, now: datetime, search_days: Optional[int] = None) -> dict:
+    """Running total of unscheduled calls per area, plus who has the soonest opening in each.
+
+    Availability is the cheapest-insertion engine in "soonest" mode, run for every mapped call on its own
+    (so a call is only counted for a technician with its trade skill and a gap long enough for it). The calls
+    share the same technicians, so openings are a guide to where to send someone, not a booking plan.
+    """
+    tz = _tz(settings)
+    n_days = max(1, min(14, int(search_days or settings["scheduling"]["search_days"])))
+    today = now.astimezone(tz).date()
+    days = [today + timedelta(days=i) for i in range(n_days)]
+    group_by = settings["areas"]["group_by"]
+    durations = get_durations(conn)
+    wmap = _warranty_map(conn)
+    techs = load_technicians(conn)
+    exceptions = exception_map(conn)
+    schedule, _ = build_schedule(conn, days, settings, durations, wmap)
+    travel = HaversineTravel.from_settings(settings)
+    max_opts = max(1, len(techs) * n_days)
+    routable = [t for t in techs if t["active"] and t["trade_skills"] and t["home_lat"] is not None]
+
+    areas: Dict[str, dict] = {}
+    total = 0
+    for r in conn.execute("SELECT * FROM jobs WHERE active = 1 AND work_status = 'unscheduled'"):
+        job = job_dict(r)
+        jid = job["hcp_job_id"]
+        w = wmap.get(jid)
+        sc = score_job(job, w, settings, now, exceptions.get(jid))
+        key, label = area_of(job, group_by)
+        a = areas.setdefault(key, {"key": key, "label": label, "count": 0, "by_trade": {}, "overdue": 0, "due_soon": 0,
+                                   "excused": 0, "unlocated": 0, "oldest_received_at": None, "_techs": {}})
+        total += 1
+        a["count"] += 1
+        trade = job["trade_code"] or "other"
+        a["by_trade"][trade] = a["by_trade"].get(trade, 0) + 1
+        a["overdue"] += sc["deadline_status"] == "overdue"
+        a["due_soon"] += sc["deadline_status"] in ("critical", "warning")
+        a["excused"] += sc["deadline_status"] == "excused"
+        received = job["hcp_created_at"]
+        if received and (a["oldest_received_at"] is None or received < a["oldest_received_at"]):
+            a["oldest_received_at"] = received
+        if job["lat"] is None or job["lng"] is None or not routable:
+            a["unlocated"] += job["lat"] is None or job["lng"] is None
+            continue
+        duration = estimate_minutes(job["trade_code"], job_text(job, w), durations,
+                                    settings["scheduling"]["default_duration_minutes"])
+        res = find_best_slots({"id": jid, "lat": job["lat"], "lng": job["lng"], "trade_code": job["trade_code"]},
+                              techs, schedule, travel, settings, now, days, duration, tz,
+                              soonest=True, limit=max_opts)
+        seen = set()
+        for o in res["options"]:                       # sorted soonest first: the first hit per tech is its earliest
+            if o["tech_id"] in seen:
+                continue
+            seen.add(o["tech_id"])
+            t = a["_techs"].setdefault(o["tech_id"], {
+                "tech_id": o["tech_id"], "name": o["tech_name"], "color": o["tech_color"], "date": o["date"],
+                "start_min": o["start_min"], "start_iso": o["start_iso"], "added_drive_min": o["added_drive_min"],
+                "job_id": jid, "eligible_jobs": 0})
+            t["eligible_jobs"] += 1
+            if (o["date"], o["start_min"]) < (t["date"], t["start_min"]):
+                t.update(date=o["date"], start_min=o["start_min"], start_iso=o["start_iso"],
+                         added_drive_min=o["added_drive_min"], job_id=jid)
+
+    out = []
+    for a in areas.values():
+        techs_out = sorted(a.pop("_techs").values(), key=lambda t: (t["date"], t["start_min"], t["name"]))
+        a["techs"] = techs_out[:5]
+        a["earliest"] = techs_out[0] if techs_out else None
+        out.append(a)
+    out.sort(key=lambda a: (-a["count"], a["label"].casefold()))
+    notes = []
+    if not routable:
+        notes.append("No technician is set up for routing yet, so openings cannot be shown (Admin > Technicians).")
+    return {"group_by": group_by, "days": n_days, "today": today.isoformat(), "areas": out,
+            "totals": {"unscheduled": total, "areas": len(out), "with_opening": sum(1 for a in out if a["earliest"])},
+            "notes": notes}

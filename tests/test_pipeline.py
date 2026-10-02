@@ -15,7 +15,8 @@ from app.hcp.fixtures import DEMO_TECH_SETUP, build_ahs_description
 from app.hcp.http import HttpError
 from app.hcp.normalize import canonical_work_status, classify_source, normalize_employee, normalize_job
 from app.services import ai_fallback
-from app.services.dispatch_view import build_dispatch, build_job_detail, compute_slots
+from app.services.dispatch_view import build_areas, build_dispatch, build_job_detail, compute_slots, load_technicians
+from app.services.job_exceptions import clear_exception, exception_map, set_exception
 from app.services.geocode import MockGeocoder, geocode_cached
 from app.services.settings_store import get_settings, replace_durations, save_settings, get_durations
 from app.services.sync import SyncService
@@ -165,7 +166,7 @@ class DispatchViewTests(unittest.TestCase):
         scores = [x["score"] for x in u]
         self.assertEqual(scores, sorted(scores, reverse=True))
         self.assertEqual(u[0]["priority_label"], "Emergency")
-        self.assertEqual(u[0]["deadline_status"] in ("critical", "overdue", "warning"), True)
+        self.assertEqual(u[0]["deadline_status"], "none")        # Emergency has no deadline clock
 
     def test_tech_routes_have_ordered_stops(self):
         techs = {t["id"]: t for t in self.view["technicians"]}
@@ -231,6 +232,198 @@ class DispatchViewTests(unittest.TestCase):
                 compute_slots(c, jid, self.settings, NOW)
 
 
+class ExceptionTests(unittest.TestCase):
+    """Dispatcher marks a job as "scheduled outside the window" (the 48 h target is not a hard limit)."""
+
+    def setUp(self):
+        self.e = Env()
+        self.e.svc.run(NOW)
+
+    def tearDown(self):
+        self.e.close()
+
+    def view(self):
+        with self.e.db.session() as c:
+            return build_dispatch(c, date(2026, 10, 1), get_settings(c), NOW)
+
+    def overdue_job(self):
+        return next(u for u in self.view()["unscheduled"] if u["deadline_status"] == "overdue")
+
+    def test_marking_a_job_excuses_it_and_it_survives_a_resync(self):
+        before = self.view()
+        job = next(u for u in before["unscheduled"] if u["deadline_status"] == "overdue" and u["priority_label"] == "Normal")
+        with self.e.db.session() as c:
+            exc = set_exception(c, job["id"], "customer_unavailable", "  back   Monday ", None)
+        self.assertEqual((exc["reason_label"], exc["note"]), ("Customer not available", "back Monday"))
+
+        for _ in range(2):                                         # second pass: after another sync from HCP
+            after = self.view()
+            entry = next(u for u in after["unscheduled"] if u["id"] == job["id"])
+            self.assertEqual(entry["deadline_status"], "excused")
+            self.assertEqual(entry["exception_label"], "Customer not available")
+            self.assertLess(entry["score"], job["score"])          # lost the overdue points
+            self.assertEqual(after["stats"]["overdue"], before["stats"]["overdue"] - 1)
+            self.e.svc.run(NOW)
+
+        with self.e.db.session() as c:
+            self.assertTrue(clear_exception(c, job["id"]))
+            self.assertFalse(clear_exception(c, job["id"]))        # already gone
+        again = next(u for u in self.view()["unscheduled"] if u["id"] == job["id"])
+        self.assertEqual((again["deadline_status"], again["exception_label"]), ("overdue", None))
+
+    def test_detail_and_slots_use_the_exception(self):
+        job = self.overdue_job()
+        with self.e.db.session() as c:
+            set_exception(c, job["id"], "other", "owner on vacation", None)
+            s = get_settings(c)
+            d = build_job_detail(c, job["id"], s, NOW)
+            slots = compute_slots(c, job["id"], s, NOW, 7)
+        self.assertEqual(d["score"]["deadline_status"], "excused")
+        self.assertEqual(d["score"]["exception"]["note"], "owner on vacation")
+        self.assertTrue(any("outside the window" in n for n in slots["notes"]))
+        self.assertFalse(any(o["misses_deadline"] for o in slots["options"]))
+
+    def test_validation(self):
+        job = self.overdue_job()["id"]
+        sched = self.e.q("SELECT hcp_job_id FROM jobs WHERE work_status = 'scheduled' LIMIT 1")[0]["hcp_job_id"]
+        with self.e.db.session() as c:
+            for reason, note in (("nonsense", ""), (None, ""), (5, ""), ("other", ""), ("other", "   "),
+                                 ("customer_unavailable", "x" * 301), ("customer_unavailable", 42)):
+                with self.assertRaises(ValueError, msg=f"{reason!r} {note!r}"):
+                    set_exception(c, job, reason, note, None)
+            with self.assertRaises(ValueError):
+                set_exception(c, sched, "customer_unavailable", "", None)       # only unscheduled jobs
+            self.assertIsNone(set_exception(c, "nope", "customer_unavailable", "", None))
+            self.assertEqual(exception_map(c), {})
+            self.assertIsNotNone(set_exception(c, job, "customer_unavailable", None, None))   # note is optional here
+
+    def test_set_by_shows_name_or_email_and_survives_user_deletion(self):
+        job = self.overdue_job()["id"]
+        with self.e.db.session() as c:
+            c.execute("INSERT INTO users(id, email, name, password_hash, role, created_at) VALUES "
+                      "(1, 'dee@example.com', 'Dee', 'x', 'dispatcher', 'now'), (2, 'sam@example.com', '', 'x', 'dispatcher', 'now')")
+            self.assertEqual(set_exception(c, job, "customer_unavailable", "", 1)["set_by"], "Dee")
+            self.assertEqual(set_exception(c, job, "customer_unavailable", "", 2)["set_by"], "sam@example.com")
+            c.execute("DELETE FROM users WHERE id = 2")
+            self.assertIsNone(exception_map(c)[job]["set_by"])      # note stays, author just becomes unknown
+
+
+class AreaTotalsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.e = Env()
+        cls.e.svc.run(NOW)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.e.close()
+
+    def areas(self, days=None, patch=None):
+        with self.e.db.session() as c:
+            s = get_settings(c)
+            if patch:
+                s = {**s, **patch}
+            return build_areas(c, s, NOW, days)
+
+    def test_running_totals_cover_every_unscheduled_call(self):
+        res = self.areas()
+        with self.e.db.session() as c:
+            n = c.execute("SELECT COUNT(*) FROM jobs WHERE active = 1 AND work_status = 'unscheduled'").fetchone()[0]
+        self.assertEqual(res["totals"]["unscheduled"], n)
+        self.assertEqual(sum(a["count"] for a in res["areas"]), n)
+        self.assertEqual(res["totals"]["areas"], len(res["areas"]))
+        self.assertEqual(res["group_by"], "city")
+        counts = [a["count"] for a in res["areas"]]
+        self.assertEqual(counts, sorted(counts, reverse=True))
+        for a in res["areas"]:
+            self.assertEqual(sum(a["by_trade"].values()), a["count"])
+
+    def test_area_keys_match_the_queue_entries(self):
+        keys = {a["key"]: a["count"] for a in self.areas()["areas"]}
+        u = self.queue_entries()
+        self.assertEqual({k: sum(1 for x in u if x["area_key"] == k) for k in keys}, keys)
+
+    def queue_entries(self):
+        with self.e.db.session() as c:
+            return build_dispatch(c, date(2026, 10, 1), get_settings(c), NOW)["unscheduled"]
+
+    def test_earliest_opening_is_real_and_sorted(self):
+        res = self.areas()
+        self.assertGreater(res["totals"]["with_opening"], 0)
+        for a in res["areas"]:
+            if not a["earliest"]:
+                continue
+            self.assertGreaterEqual(a["earliest"]["date"], res["today"])
+            order = [(t["date"], t["start_min"]) for t in a["techs"]]
+            self.assertEqual(order, sorted(order))
+            self.assertEqual(a["earliest"], a["techs"][0])
+            self.assertLessEqual(a["earliest"]["eligible_jobs"], a["count"])
+
+    def test_calls_without_a_map_location_are_counted_but_have_no_opening(self):
+        res = self.areas()
+        unmapped = next(a for a in res["areas"] if a["unlocated"])
+        self.assertGreaterEqual(unmapped["count"], unmapped["unlocated"])
+        self.assertEqual(unmapped["count"], unmapped["unlocated"])      # the demo's address-less job is alone in its area
+        self.assertIsNone(unmapped["earliest"])
+        self.assertEqual(unmapped["techs"], [])
+
+    def test_trade_skill_is_respected(self):
+        res = self.areas()
+        hvac_only = next(a for a in res["areas"] if a["by_trade"] == {"HVAC": 1} and a["earliest"])
+        tech_skills = {t["id"]: t["trade_skills"] for t in self.techs()}
+        for t in hvac_only["techs"]:
+            self.assertIn("HVAC", tech_skills[t["tech_id"]])
+
+    def techs(self):
+        with self.e.db.session() as c:
+            return load_technicians(c)
+
+    def test_grouping_by_zip(self):
+        res = self.areas(patch={"areas": {"group_by": "zip"}})
+        self.assertEqual(res["group_by"], "zip")
+        mapped = [a for a in res["areas"] if a["key"] != "none"]          # the address-less demo job has no area
+        self.assertTrue(mapped)
+        self.assertTrue(all(a["key"].startswith("zip:") and a["label"].startswith("ZIP ") for a in mapped), mapped)
+        self.assertEqual(sum(a["count"] for a in res["areas"]), self.areas()["totals"]["unscheduled"])
+
+    def test_wider_window_never_finds_fewer_openings(self):
+        one, seven = self.areas(1), self.areas(7)
+        self.assertEqual((one["days"], seven["days"]), (1, 7))
+        self.assertLessEqual(one["totals"]["with_opening"], seven["totals"]["with_opening"])
+        by_key = {a["key"]: a for a in seven["areas"]}
+        for a in one["areas"]:
+            if a["earliest"]:
+                self.assertEqual(by_key[a["key"]]["earliest"]["date"], a["earliest"]["date"])  # same soonest slot
+
+    def test_no_routable_technicians_is_explained(self):
+        e = Env()
+        try:
+            e.svc.run(NOW)
+            with e.db.session() as c:
+                c.execute("UPDATE technicians SET active = 0")
+                res = build_areas(c, get_settings(c), NOW)
+            self.assertTrue(res["notes"])
+            self.assertEqual(res["totals"]["with_opening"], 0)
+            self.assertGreater(res["totals"]["unscheduled"], 0)          # the running totals still work
+        finally:
+            e.close()
+
+    def test_excused_and_overdue_counts(self):
+        e = Env()
+        try:
+            e.svc.run(NOW)
+            with e.db.session() as c:
+                before = build_areas(c, get_settings(c), NOW)
+                jid = next(u["id"] for u in build_dispatch(c, date(2026, 10, 1), get_settings(c), NOW)["unscheduled"]
+                           if u["deadline_status"] == "overdue")
+                set_exception(c, jid, "customer_unavailable", "", None)
+                after = build_areas(c, get_settings(c), NOW)
+            self.assertEqual(sum(a["overdue"] for a in after["areas"]), sum(a["overdue"] for a in before["areas"]) - 1)
+            self.assertEqual(sum(a["excused"] for a in after["areas"]), 1)
+        finally:
+            e.close()
+
+
 class SettingsTests(unittest.TestCase):
     def test_settings_roundtrip_and_durations(self):
         e = Env()
@@ -240,6 +433,8 @@ class SettingsTests(unittest.TestCase):
                 self.assertEqual(s["scoring"]["base_direct_lead"], 44)
                 self.assertEqual(s["scoring"]["base_by_priority"]["Emergency"], 100)   # untouched
                 self.assertEqual(s["deadline_rules"], {"AHS": {"Normal": 48}})          # free-form map replaced
+                # ...and it stays replaced on the next read: removed rules must not reappear from the defaults
+                self.assertEqual(get_settings(c)["deadline_rules"], {"AHS": {"Normal": 48}})
                 self.assertEqual(get_settings(c)["scoring"]["base_direct_lead"], 44)
                 with self.assertRaises(ValueError):
                     save_settings(c, {"scoring": {"base_direct_lead": "lots"}})

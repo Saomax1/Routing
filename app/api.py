@@ -29,8 +29,9 @@ from starlette.routing import Route
 from .db import jdump, jload, utcnow_iso
 from .domain.timeutil import hhmm_to_minutes, parse_date
 from .security import MIN_PASSWORD_LENGTH, ROLES, burn_verify, hash_password, verify_password
-from .services.dispatch_view import build_dispatch, build_job_detail, compute_slots, load_technicians
+from .services.dispatch_view import build_areas, build_dispatch, build_job_detail, compute_slots, load_technicians
 from .services.geocode import geocode_cached
+from .services.job_exceptions import clear_exception, reason_options, set_exception
 from .services.settings_store import (get_durations, get_settings, replace_durations, save_settings, seed_durations)
 
 log = logging.getLogger("routing.api")
@@ -167,7 +168,8 @@ def app_config(ctx: Ctx, _):
     tz = ZoneInfo(s["timezone"])
     return {"mode": ctx.cfg.hcp_mode, "geocoder": ctx.cfg.geocoder, "timezone": s["timezone"],
             "today": now_utc().astimezone(tz).date().isoformat(), "map": s["map"],
-            "sync_interval_seconds": ctx.cfg.sync_interval_seconds, "llm_enabled": ctx.cfg.llm_enabled}
+            "sync_interval_seconds": ctx.cfg.sync_interval_seconds, "llm_enabled": ctx.cfg.llm_enabled,
+            "exception_reasons": reason_options()}
 
 
 # ------------------------------------------------------------------------ dispatch
@@ -203,6 +205,43 @@ def job_slots(ctx: Ctx, body):
     if res is None:
         raise ApiError(404, "Job not found")
     return res
+
+
+def _days_param(raw) -> Optional[int]:
+    if raw is None:
+        return None
+    try:
+        days = int(raw)
+    except (TypeError, ValueError):
+        days = 0
+    if not 1 <= days <= 14:
+        raise ApiError(400, "days must be an integer from 1 to 14")
+    return days
+
+
+@endpoint()
+def areas(ctx: Ctx, _):
+    days = _days_param(ctx.q.get("days"))
+    with ctx.db.session() as conn:
+        return build_areas(conn, get_settings(conn), now_utc(), days)
+
+
+@endpoint(body=True)
+def exception_put(ctx: Ctx, body):
+    """Mark an unscheduled job as being scheduled outside its deadline window (local note, nothing goes to HCP)."""
+    with ctx.db.session() as conn:
+        exc = set_exception(conn, ctx.path["job_id"], body.get("reason"), body.get("note"), ctx.user["id"])
+    if exc is None:
+        raise ApiError(404, "Job not found")
+    return {"exception": exc}
+
+
+@endpoint()
+def exception_delete(ctx: Ctx, _):
+    with ctx.db.session() as conn:
+        if not clear_exception(conn, ctx.path["job_id"]):
+            raise ApiError(404, "That job is not marked as outside the window")
+    return {"ok": True}
 
 
 # -------------------------------------------------------------------- technicians
@@ -415,6 +454,9 @@ ROUTES = [
     Route("/api/dispatch", dispatch),
     Route("/api/jobs/{job_id}", job_detail),
     Route("/api/jobs/{job_id}/slots", job_slots, methods=["POST"]),
+    Route("/api/jobs/{job_id}/exception", exception_put, methods=["PUT"]),
+    Route("/api/jobs/{job_id}/exception", exception_delete, methods=["DELETE"]),
+    Route("/api/areas", areas),
     Route("/api/technicians", technicians_list),
     Route("/api/technicians/{tech_id}", technician_update, methods=["PUT"]),
     Route("/api/settings", settings_get, methods=["GET"]),

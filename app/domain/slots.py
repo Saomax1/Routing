@@ -17,6 +17,9 @@ Cost = added drive minutes + a per-day delay penalty that depends on priority (s
 prefers today even if it adds more driving) + a penalty if the slot misses the job's deadline.
 Only the best option per (tech, day) is kept, then the top N overall are returned.
 
+``soonest=True`` ranks by start time instead (earlier day first, then earlier start, drive time only breaks
+ties). The Areas tab uses it to answer "who has an opening first?".
+
 Pure functions only - no database, no network. Travel time comes from a ``TravelTimeProvider``.
 """
 
@@ -51,10 +54,12 @@ def find_best_slots(
     tz: ZoneInfo,
     priority_label: str = "Normal",
     deadline_at: Optional[datetime] = None,
+    soonest: bool = False,
+    limit: Optional[int] = None,
 ) -> dict:
     cfg = settings["scheduling"]
     step = int(cfg.get("round_to_minutes", 5))
-    top_n = int(cfg.get("top_n", 5))
+    top_n = int(limit if limit is not None else cfg.get("top_n", 5))
     penalty_per_day = float(cfg["day_penalty_minutes"].get(priority_label, 15))
     miss_penalty = float(cfg.get("deadline_miss_penalty", 300))
     lead = int(cfg.get("same_day_lead_minutes", 30))
@@ -138,7 +143,10 @@ def find_best_slots(
 
                 end_dt = at_local_minutes(d, end, tz)
                 misses = bool(deadline_at and end_dt > deadline_at)
-                cost = added + day_idx * penalty_per_day + (miss_penalty if misses else 0.0) + arrive * 0.001
+                if soonest:
+                    cost = day_idx * 24 * 60 + arrive + added * 0.01
+                else:
+                    cost = added + day_idx * penalty_per_day + (miss_penalty if misses else 0.0) + arrive * 0.001
 
                 if best is None or cost < best["cost"]:
                     new_stop = {"id": job["id"], "lat": job_loc[0], "lng": job_loc[1],
@@ -180,7 +188,7 @@ def find_best_slots(
     best_per_slot.sort(key=lambda o: o["cost"])
     notes = []
     if deadline_passed:
-        notes.append("This job's deadline has already passed, so options are ranked by how soon and how cheaply it can be done.")
+        notes.append("This job is already past its scheduling window, so options are ranked by how soon and how cheaply it can be done.")
     if not best_per_slot:
         notes.append("No feasible slot found in the search window. Try a longer window or adjust technician hours/skills.")
     return {"options": best_per_slot[:top_n], "ineligible": ineligible, "notes": notes}

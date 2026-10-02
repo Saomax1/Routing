@@ -8,6 +8,10 @@ Priority scoring for unscheduled jobs (spec 7.4).
 
 Every component is returned in ``breakdown`` so dispatchers can see *why* a job ranks where it does.
 All weights and deadline rules come from settings (Admin > Settings); nothing is hard-coded here.
+
+Deadlines are targets, not hard limits. A job a dispatcher has marked "scheduled outside the window"
+(``exception``) keeps its deadline time for reference but is reported as ``excused``: no deadline points and
+it never counts as overdue.
 """
 
 from __future__ import annotations
@@ -57,7 +61,8 @@ def deadline_status(fraction_left: Optional[float], remaining_h: Optional[float]
     return "ok"
 
 
-def score_job(job: dict, warranty: Optional[dict], settings: dict, now: datetime) -> dict:
+def score_job(job: dict, warranty: Optional[dict], settings: dict, now: datetime,
+              exception: Optional[dict] = None) -> dict:
     sc = settings["scoring"]
     category = job.get("source_category", "direct")
     label = priority_label(job, warranty)
@@ -83,6 +88,10 @@ def score_job(job: dict, warranty: Optional[dict], settings: dict, now: datetime
         remaining_h = (deadline_at - now).total_seconds() / 3600.0
         fraction_left = remaining_h / window_h
     status = deadline_status(fraction_left, remaining_h)
+    if exception and status != "none":
+        status = "excused"
+        breakdown.append({"label": f"Outside the window: {exception.get('reason_label') or 'excused'} (no deadline points)",
+                          "points": 0.0})
     dp = sc["deadline_points"].get(status, 0)
     if dp:
         breakdown.append({"label": f"Deadline {status}", "points": float(dp)})
@@ -111,4 +120,5 @@ def score_job(job: dict, warranty: Optional[dict], settings: dict, now: datetime
         "deadline_status": status,
         "age_hours": None if age_h is None else round(age_h, 1),
         "urgency_flags": flags,
+        "exception": exception,
     }
