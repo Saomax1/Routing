@@ -177,7 +177,10 @@ dl { margin: 0; } .kv { display: grid; grid-template-columns: 110px minmax(0, 1f
 .stop { width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; background: var(--c); color: #fff; border: 2px solid #fff; font: 700 12px system-ui; box-shadow: 0 1px 3px rgba(0, 0, 0, .5); cursor: default; }
 .stop.hl { transform: scale(1.25); }
 .home { width: 24px; height: 24px; border-radius: 7px; display: grid; place-items: center; background: #fff; color: var(--c); border: 2px solid var(--c); box-shadow: 0 1px 3px rgba(0, 0, 0, .4); }
-.newpin { width: 46px; height: 46px; border-radius: 50%; display: grid; place-items: center; background: #fff; border: 3px dashed var(--c); color: #111; font: 800 11px system-ui; box-shadow: 0 2px 8px rgba(0, 0, 0, .5); animation: pulse 1.4s ease-in-out infinite; }
+/* map.js positions the marker with an inline transform, so the marker itself must never be animated (an animated
+   transform replaces the inline one and flings the marker across the map). The circle inside pulses instead. */
+.newpin { width: 46px; height: 46px; }
+.newpin > span { display: grid; place-items: center; width: 100%; height: 100%; border-radius: 50%; background: #fff; border: 3px dashed var(--c); color: #111; font: 800 11px system-ui; box-shadow: 0 2px 8px rgba(0, 0, 0, .5); animation: pulse 1.4s ease-in-out infinite; }
 
 @keyframes spin { to { transform: rotate(360deg); } } @keyframes pulse { 50% { transform: scale(1.12); } }
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
