@@ -16,6 +16,7 @@ export function mountDispatch(root, ctx) {
     view: 'queue', areas: null, areasLoading: false, areasError: null, areaDays: null,
     hidden: new Set(), selectedId: null, detail: null, detailLoading: false,
     slots: null, slotsFor: null, slotsLoading: false, slotDays: 3, hoverOpt: null, pinnedOpt: null,
+    slotWindow: (config.scheduling && config.scheduling.window_minutes) || 240,
     firstFit: true, lastUpdated: null, error: null,
   };
 
@@ -81,7 +82,8 @@ export function mountDispatch(root, ctx) {
       h('span', { class: 'stat' }, h('b', {}, d.stats.unscheduled), ' unscheduled'),
       d.stats.overdue ? h('span', { class: 'stat bad' }, h('b', {}, d.stats.overdue), ' overdue') : null,
       d.stats.unmapped ? h('span', { class: 'stat dim', title: 'Jobs without a map location (see the job card)' }, h('b', {}, d.stats.unmapped), ' unmapped') : null,
-      h('span', { class: 'stat' }, h('b', {}, d.stats.scheduled_today), ' scheduled this day'));
+      h('span', { class: 'stat' }, h('b', {}, d.stats.scheduled_today), ' scheduled this day'),
+      d.stats.completed_today ? h('span', { class: 'stat done', title: 'Marked complete in Housecall Pro' }, h('b', {}, d.stats.completed_today), ' completed') : null);
     const chips = h('div', { class: 'dp-techs', role: 'group', 'aria-label': 'Technicians' },
       d.technicians.map((t) => h('button', {
         class: `tech-chip${state.hidden.has(t.id) ? ' off' : ''}${t.active ? '' : ' inactive'}`, type: 'button', 'aria-pressed': String(!state.hidden.has(t.id)),
@@ -89,7 +91,7 @@ export function mountDispatch(root, ctx) {
         title: t.needs_setup ? 'Needs trade skills and a home base: Admin > Technicians' : `${t.name}: click to show/hide`,
         onclick: () => { state.hidden.has(t.id) ? state.hidden.delete(t.id) : state.hidden.add(t.id); renderToolbar(); renderMap(false); },
       }, h('span', { class: 'dot' }), h('span', { class: 'tc-name' }, t.name),
-      h('span', { class: 'tc-meta', title: driveTotal(t) != null ? 'Total drive time by road' : 'Straight-line estimate' }, `${t.job_count} job${t.job_count === 1 ? '' : 's'}${(driveTotal(t) ?? t.drive_min) ? ` · ${Math.round(driveTotal(t) ?? t.drive_min)} min drive` : ''}`),
+      h('span', { class: 'tc-meta', title: driveTotal(t) != null ? 'Total drive time by road' : 'Straight-line estimate' }, `${t.job_count} job${t.job_count === 1 ? '' : 's'}${t.done_count ? ` · ${t.done_count} done` : ''}${(driveTotal(t) ?? t.drive_min) ? ` · ${Math.round(driveTotal(t) ?? t.drive_min)} min drive` : ''}`),
       t.needs_setup ? icon('alert', 13) : null)));
     const sync = h('div', { class: 'dp-sync' },
       h('span', { class: 'dim' }, d.last_sync ? `Synced ${timeAgo(d.last_sync.finished_at || d.last_sync.started_at)}${d.last_sync.status === 'error' ? ' (failed)' : ''}` : 'Never synced'),
@@ -193,11 +195,11 @@ export function mountDispatch(root, ctx) {
   }
   function areaCard(x, a) {
     const open = () => { state.filters.area = x.key; state.view = 'queue'; renderQueue(); renderMap(false); };
-    const when = (t) => `${dayWord(t.date, a.today)} · ${fmtMinutes(t.start_min)}`;
+    const when = (t) => `${dayWord(t.date, a.today)} · ${fmtMinutes(t.window_start_min)}–${fmtMinutes(t.window_end_min)}`;
     const chips = [];
     if (x.overdue) chips.push(h('span', { class: 'chip dl-overdue', title: 'Past the deadline window' }, `${x.overdue} overdue`));
     if (x.due_soon) chips.push(h('span', { class: 'chip dl-warning', title: 'Deadline window is closing' }, `${x.due_soon} due soon`));
-    if (x.excused) chips.push(h('span', { class: 'chip dl-excused', title: 'Marked as scheduled outside the deadline window' }, `${x.excused} outside window`));
+    if (x.excused) chips.push(h('span', { class: 'chip dl-excused', title: 'Deadline waived: these are being booked late on purpose' }, `${x.excused} deadline waived`));
     for (const [trade, n] of Object.entries(x.by_trade).sort()) chips.push(badge(`${trade} ${n}`, 'trade'));
     if (x.unlocated) chips.push(h('span', { class: 'chip warn', title: 'No map location, so openings cannot be checked for these' }, icon('mapoff', 12), ` ${x.unlocated} no location`));
     const checkable = x.count - x.unlocated;
@@ -218,7 +220,7 @@ export function mountDispatch(root, ctx) {
   function chips(u) {
     const out = [badge(SOURCE_LABEL[u.source_category] || u.source_category, `src src-${u.source_category}`)];
     if (u.trade_code) out.push(badge(u.trade_code, 'trade'));
-    if (u.deadline_status === 'excused') out.push(h('span', { class: 'chip dl-excused', title: `Scheduling outside the deadline window: ${u.exception_label}` }, icon('clock', 12), ' outside window'));
+    if (u.deadline_status === 'excused') out.push(h('span', { class: 'chip dl-excused', title: `Deadline waived: ${u.exception_label}` }, icon('clock', 12), ' deadline waived'));
     else if (u.deadline_status !== 'none') out.push(h('span', { class: `chip dl-${u.deadline_status}`, title: 'Time left until the contact/schedule deadline (Admin > Settings). A target, not a hard limit.' }, icon('clock', 12), ' ', fmtLeft(u.deadline_hours_left)));
     if (u.age_hours != null) out.push(h('span', { class: 'chip dim', title: 'Time since the job arrived in Housecall Pro' }, `waiting ${fmtAge(u.age_hours)}`));
     if (u.urgency_flags.length) out.push(h('span', { class: 'chip urgent', title: 'Urgency keywords found in the problem text' }, icon('droplet', 12), ' ', u.urgency_flags.slice(0, 2).join(', ')));
@@ -281,7 +283,7 @@ export function mountDispatch(root, ctx) {
     if (d.lat == null) alerts.push(h('div', { class: 'alert warn' }, icon('mapoff', 14), ` No map location (${d.geocode_status}). Check the address in Housecall Pro; slots cannot be computed without one.`));
 
     const dl = sc.deadline_status === 'excused'
-      ? h('div', { class: 'd-deadline dl-excused' }, icon('clock', 14), ' Outside the window · ', h('b', {}, sc.exception.reason_label))
+      ? h('div', { class: 'd-deadline dl-excused' }, icon('clock', 14), ' Deadline waived · ', h('b', {}, sc.exception.reason_label))
       : sc.deadline_status !== 'none'
         ? h('div', { class: `d-deadline dl-${sc.deadline_status}` }, icon('clock', 14), ` Target ${fmtDateTime(sc.deadline_at)} · `, h('b', {}, fmtLeft(sc.deadline_hours_left)))
         : h('div', { class: 'd-deadline dim' }, 'No deadline clock for this job type (Admin > Settings).');
@@ -290,9 +292,14 @@ export function mountDispatch(root, ctx) {
     // --- slot finder
     const daysSel = h('select', { 'aria-label': 'Days to search', onchange: (e) => { state.slotDays = Number(e.target.value); if (state.slots) findSlots(); } },
       [1, 2, 3, 5, 7, 14].map((n) => h('option', { value: n, selected: n === state.slotDays }, `${n} day${n === 1 ? '' : 's'}`)));
+    // arrival window offered to the customer: the company standard (Admin > Settings), changeable for this job
+    const windowSel = h('select', { 'aria-label': 'Arrival window length', onchange: (e) => { state.slotWindow = Number(e.target.value); if (state.slots) findSlots(); } },
+      [...new Set([60, 120, 180, 240, 300, 360, 480, state.slotWindow])].sort((x, y) => x - y)
+        .map((m) => h('option', { value: m, selected: m === state.slotWindow }, fmtDuration(m))));
     const slotPanel = h('section', { class: 'd-sec slots' },
       h('div', { class: 'slots-head' }, h('h3', {}, 'Best slots'),
-        h('div', { class: 'slots-ctl' }, h('label', { class: 'dim' }, 'Search ', daysSel),
+        h('div', { class: 'slots-ctl' }, h('label', { class: 'dim', title: 'How long a time window the customer is given to expect the technician in' }, 'Window ', windowSel),
+          h('label', { class: 'dim' }, 'Search ', daysSel),
           h('button', { class: 'btn primary', type: 'button', disabled: state.slotsLoading || d.lat == null || d.work_status !== 'unscheduled', onclick: findSlots },
             icon('route', 14), state.slotsLoading ? ' Finding…' : ' Find best slot'))),
       renderSlots(d));
@@ -327,13 +334,13 @@ export function mountDispatch(root, ctx) {
     render(queue, hdr, h('div', { class: 'd-body' }, alerts, scoreCard, exceptionPanel(d), slotPanel, section('Problem', items), contact, warranty, breakdown, warnings, raw));
   }
 
-  // ------------------------------------------------- scheduled outside the window
+  // ------------------------------------------------------------ deadline waived
   // The deadline is a target. A dispatcher records why a job is being booked later (customer not available, ...):
   // it stops counting as overdue and slots are no longer ranked against the deadline. Saved in this app only.
   function exceptionPanel(d) {
     const sc = d.score, ex = sc.exception;
     if (d.work_status !== 'unscheduled' || (sc.deadline_status === 'none' && !ex)) return null;
-    const reason = h('select', { 'aria-label': 'Reason' }, h('option', { value: '' }, 'Why is it outside the window?'),
+    const reason = h('select', { 'aria-label': 'Reason' }, h('option', { value: '' }, 'Why is the deadline being waived?'),
       (config.exception_reasons || []).map((r) => h('option', { value: r.code, selected: !!ex && ex.reason === r.code }, r.label)));
     const note = h('input', { type: 'text', maxlength: 300, placeholder: 'Note (required for “Other”)', 'aria-label': 'Note', value: ex ? ex.note : '' });
     const st = h('span', { class: 'f-status', role: 'status' });
@@ -343,7 +350,7 @@ export function mountDispatch(root, ctx) {
       e.preventDefault();
       if (!reason.value) return fail('Choose a reason.');
       save.disabled = true;
-      try { await api.setException(d.id, { reason: reason.value, note: note.value }); toast('Marked as scheduled outside the window', 'ok'); await refreshJob(d.id); }
+      try { await api.setException(d.id, { reason: reason.value, note: note.value }); toast('Deadline waived', 'ok'); await refreshJob(d.id); }
       catch (err) { fail(err.message); save.disabled = false; }
     } }, reason, note, h('div', { class: 'exc-actions' }, save,
       ex ? h('button', { class: 'btn', type: 'button', onclick: async () => {
@@ -352,7 +359,7 @@ export function mountDispatch(root, ctx) {
     const intro = ex
       ? h('p', { class: 'plain' }, h('b', {}, ex.reason_label), ex.note ? ` – ${ex.note}` : '', h('span', { class: 'dim' }, ` · marked ${ex.set_by ? `by ${ex.set_by} ` : ''}${fmtDateTime(ex.set_at)}`))
       : h('p', { class: 'dim hint' }, 'The deadline is a target, not a hard limit. If the customer isn’t available, or there’s another reason to book later, record it here: the job stops counting as overdue and slots are no longer ranked against the deadline. Saved in this app only; nothing is written to Housecall Pro.');
-    return h('details', { class: 'd-sec exc', open: !!ex }, h('summary', {}, ex ? 'Scheduled outside the window' : 'Scheduling this outside the window?'), intro, form);
+    return h('details', { class: 'd-sec exc', open: !!ex }, h('summary', {}, ex ? 'Deadline waived' : 'Booking this past its deadline?'), intro, form);
   }
   async function refreshJob(id) {
     try { state.detail = await api.job(id); } catch (e) { toast(e.message, 'error'); }
@@ -365,21 +372,27 @@ export function mountDispatch(root, ctx) {
   async function findSlots() {
     const id = state.selectedId; state.slotsLoading = true; state.hoverOpt = state.pinnedOpt = null;
     renderQueue();
-    try { state.slots = await api.slots(id, state.slotDays); state.slotsFor = id; }
+    try { state.slots = await api.slots(id, state.slotDays, state.slotWindow); state.slotsFor = id; }
     catch (e) { toast(e.message, 'error'); state.slots = null; }
     state.slotsLoading = false;
     if (state.selectedId === id) { renderQueue(); renderMap(false); }
   }
   function renderSlots(d) {
     const s = state.slots;
-    if (!s || state.slotsFor !== d.id) return h('p', { class: 'dim hint' }, 'Finds the cheapest place in each technician’s day (least added driving), respecting skills, shifts, existing appointment times and priority. Suggestions only: nothing is written to Housecall Pro.');
-    const out = [h('p', { class: 'dim hint' }, `${fmtDuration(s.duration_min)} job · searched ${s.search_days} day${s.search_days === 1 ? '' : 's'} · drive times are straight-line estimates`)];
+    if (!s || state.slotsFor !== d.id) return h('p', { class: 'dim hint' }, 'Finds the cheapest place in each technician’s day (least added driving) and offers an arrival window to book. Windows may overlap, and a nearby job is offered the same window. Skills, shifts, existing windows and priority are respected. Suggestions only: nothing is written to Housecall Pro.');
+    const out = [h('p', { class: 'dim hint' }, `${fmtDuration(s.duration_min)} job · ${fmtDuration(s.window_minutes)} arrival windows (they may overlap) · searched ${s.search_days} day${s.search_days === 1 ? '' : 's'} · ranking uses straight-line drive estimates`)];
     if (!s.options.length) out.push(h('div', { class: 'alert warn' }, icon('alert', 14), ' ', s.notes[0] || 'No feasible slot found.'));
     s.options.forEach((o, i) => out.push(slotCard(o, i)));
     if (s.notes.length && s.options.length) s.notes.forEach((n) => out.push(h('p', { class: 'dim hint' }, n)));
     if (s.ineligible.length) out.push(h('details', { class: 'inel' }, h('summary', {}, `${s.ineligible.length} technician${s.ineligible.length === 1 ? '' : 's'} not suggested`),
       h('ul', {}, s.ineligible.map((x) => h('li', {}, h('b', {}, x.name), ` – ${x.reason}`)))));
     return h('div', { class: 'slot-list' }, out);
+  }
+  // "Same window as Jane (5 min away)" when the new job gets exactly the neighbour's window, else the overlap is spelled out
+  function stackText(list) {
+    const one = (x) => `${x.same_window ? 'same window as ' : 'overlaps '}${x.label || 'another job'}${x.same_window ? '' : `’s ${fmtMinutes(x.window_start_min)}–${fmtMinutes(x.window_end_min)} window`} (${Math.round(x.drive_min)} min away)`;
+    const text = list.slice(0, 2).map(one).join('; ') + (list.length > 2 ? `; and ${list.length - 2} more nearby` : '');
+    return text.charAt(0).toUpperCase() + text.slice(1);
   }
   function slotCard(o, i) {
     const pinned = state.pinnedOpt && state.pinnedOpt.tech_id === o.tech_id && state.pinnedOpt.date === o.date;
@@ -389,10 +402,11 @@ export function mountDispatch(root, ctx) {
       onclick: pick, onkeydown: onEnter(pick),
       onmouseenter: () => { state.hoverOpt = o; renderMap(false); }, onmouseleave: () => { state.hoverOpt = null; renderMap(false); },
     },
-    h('div', { class: 'slot-top' }, h('span', { class: 'dot' }), h('b', {}, o.tech_name), h('span', { class: 'slot-when' }, `${fmtDay(o.date)} · ${fmtMinutes(o.start_min)} – ${fmtMinutes(o.end_min)}`), i === 0 ? badge('best', 'best') : null),
-    h('div', { class: 'slot-meta' }, `Stop ${o.position} of ${o.stops_in_day + 1} · `, h('b', {}, `+${Math.round(o.added_drive_min)} min driving`),
-      ` · ${Math.round(o.drive_in_min)} min to get there${o.before_stop_id ? `, ${Math.round(o.drive_out_min)} min to next stop` : ''}`),
-    o.misses_deadline ? h('div', { class: 'slot-warn' }, icon('alert', 12), ' Falls outside the scheduling window') : null,
+    h('div', { class: 'slot-top' }, h('span', { class: 'dot' }), h('b', {}, o.tech_name), h('span', { class: 'slot-when', title: 'Arrival window to give the customer' }, `${fmtDay(o.date)} · ${fmtMinutes(o.window_start_min)} – ${fmtMinutes(o.window_end_min)}`), i === 0 ? badge('best', 'best') : null),
+    h('div', { class: 'slot-meta' }, h('b', {}, `Arrive about ${fmtMinutes(o.start_min)}`), ` · stop ${o.position} of ${o.stops_in_day + 1} · `, h('b', {}, `+${Math.round(o.added_drive_min)} min driving`),
+      ` · ${Math.round(o.drive_in_min)} min from ${!o.after_stop_id ? (o.origin && o.origin.kind === 'complete' ? 'the last finished job' : o.origin && o.origin.kind === 'in_progress' ? 'the job under way' : 'home') : 'the stop before'}${o.before_stop_id ? `, ${Math.round(o.drive_out_min)} min to the next stop` : ''}`),
+    o.stacked_with && o.stacked_with.length ? h('div', { class: 'slot-stack' }, icon('check', 12), ' ', stackText(o.stacked_with)) : null,
+    o.misses_deadline ? h('div', { class: 'slot-warn' }, icon('alert', 12), ' Finishes after the deadline target') : null,
     o.date !== state.date ? h('div', { class: 'slot-hint dim' }, 'Click to view this day on the map') : null);
   }
 
@@ -415,12 +429,16 @@ export function mountDispatch(root, ctx) {
     el.addEventListener('click', open); el.addEventListener('keydown', onEnter(open));
     el.addEventListener('mouseenter', () => { const row = queue.querySelector(`.q-row[data-id="${CSS.escape(u.id)}"]`); if (row) { row.classList.add('hl'); row.scrollIntoView({ block: 'nearest' }); } });
     el.addEventListener('mouseleave', () => { const row = queue.querySelector(`.q-row[data-id="${CSS.escape(u.id)}"]`); if (row) row.classList.remove('hl'); });
-    map.tip(el, [`${rank}. ${u.priority_label} · ${u.customer_name || 'Unknown'}`, u.address, u.summary, `${SOURCE_LABEL[u.source_category]}${u.trade_code ? ' · ' + u.trade_code : ''} · score ${Math.round(u.score)}${u.deadline_status === 'excused' ? ' · outside window' : u.deadline_status !== 'none' ? ' · ' + fmtLeft(u.deadline_hours_left) : ''}`].filter(Boolean));
+    map.tip(el, [`${rank}. ${u.priority_label} · ${u.customer_name || 'Unknown'}`, u.address, u.summary, `${SOURCE_LABEL[u.source_category]}${u.trade_code ? ' · ' + u.trade_code : ''} · score ${Math.round(u.score)}${u.deadline_status === 'excused' ? ' · deadline waived' : u.deadline_status !== 'none' ? ' · ' + fmtLeft(u.deadline_hours_left) : ''}`].filter(Boolean));
     return el;
   }
   function makeStop(s, t) {
-    const el = h('div', { class: 'stop', style: { '--c': t ? t.color : '#64748b' } }, s.seq ? String(s.seq) : '·');
-    map.tip(el, [`${fmtTime(s.start_iso)}–${fmtTime(s.end_iso)} · ${s.customer_name || 'Customer'}`, s.address, s.summary, t ? `${t.name} · stop ${s.seq}` : 'No technician assigned'].filter(Boolean));
+    const done = s.status === 'complete', prog = s.status === 'in_progress';
+    const el = h('div', { class: `stop${done ? ' done' : ''}${prog ? ' prog' : ''}`, style: { '--c': t ? t.color : '#64748b' } }, done ? icon('check', 14) : s.seq ? String(s.seq) : '·');
+    const head = done ? `Completed${s.completed_iso ? ' ' + fmtTime(s.completed_iso) : ''} · ${s.customer_name || 'Customer'}`
+      : prog ? `In progress · ${s.customer_name || 'Customer'}` : `${s.customer_name || 'Customer'}`;
+    const when = done ? '' : `Window ${fmtMinutes(s.window_start_min)}–${fmtMinutes(s.window_end_min)} · job ${fmtTime(s.start_iso)}–${fmtTime(s.end_iso)}`;
+    map.tip(el, [head, when, s.address, s.summary, t ? `${t.name} · stop ${s.seq}` : 'No technician assigned'].filter(Boolean));
     return el;
   }
 
@@ -496,7 +514,8 @@ export function mountDispatch(root, ctx) {
     // slot preview (hover or pinned), drawn on top
     const opt = state.hoverOpt || state.pinnedOpt;
     if (opt && opt.date === d.date) {
-      const nodes = (opt.home ? [{ p: [opt.home.lat, opt.home.lng], label: 'Home' }] : [])
+      const from = opt.origin || opt.home, fromLabel = opt.origin && opt.origin.kind !== 'home' ? 'Last job' : 'Home';
+      const nodes = (from ? [{ p: [from.lat, from.lng], label: fromLabel }] : [])
         .concat(opt.route_preview.filter((p) => p.lat != null).map((p, i) => ({ p: [p.lat, p.lng], label: p.is_new ? 'New job' : `Stop ${i + 1}` })));
       for (let i = 1; i < nodes.length; i++) {
         const a = nodes[i - 1].p, b = nodes[i].p, r = routeFor(a, b), points = r && r.path ? r.path : [a, b];
@@ -507,7 +526,7 @@ export function mountDispatch(root, ctx) {
       const np = opt.route_preview.find((p) => p.is_new);
       if (np && np.lat != null) {
         const nm = h('div', { class: 'newpin', style: { '--c': opt.tech_color || '#111827' } }, h('span', {}, 'NEW'));
-        map.tip(nm, [`Proposed: ${fmtMinutes(opt.start_min)} – ${fmtMinutes(opt.end_min)}`, `${opt.tech_name} · +${Math.round(opt.added_drive_min)} min driving`]);
+        map.tip(nm, [`Window ${fmtMinutes(opt.window_start_min)} – ${fmtMinutes(opt.window_end_min)}`, `Arrive about ${fmtMinutes(opt.start_min)} · done ${fmtMinutes(opt.end_min)}`, `${opt.tech_name} · +${Math.round(opt.added_drive_min)} min driving`]);
         map.addMarker('preview-new', np.lat, np.lng, nm, 60);
       }
     }
@@ -535,7 +554,7 @@ function buildLegend() {
   const el = h('details', { class: 'dp-legend' }, h('summary', {}, 'Legend'),
     h('div', { class: 'lg-row' }, h('b', {}, 'Shape'), shape('ahs', 'AHS'), shape('other', 'Other warranty'), shape('direct', 'Direct lead')),
     h('div', { class: 'lg-row' }, h('b', {}, 'Color'), dot('prio-emergency', 'Emergency'), dot('prio-expedited', 'Expedited'), dot('prio-normal', 'Normal'), dot('prio-direct', 'Direct')),
-    h('div', { class: 'lg-row' }, h('b', {}, 'Ring'), dot('ring-warning', 'window closing'), dot('ring-critical', 'critical'), dot('ring-overdue', 'overdue'), h('span', { class: 'dim' }, '(none = outside window or no deadline)')),
-    h('div', { class: 'lg-row dim' }, 'Numbers = queue rank · water drop = urgency keyword · colored circles = scheduled stops by technician · hover a route line for its drive time'));
+    h('div', { class: 'lg-row' }, h('b', {}, 'Ring'), dot('ring-warning', 'deadline closing'), dot('ring-critical', 'critical'), dot('ring-overdue', 'overdue'), h('span', { class: 'dim' }, '(none = deadline waived or no deadline)')),
+    h('div', { class: 'lg-row dim' }, 'Numbers = queue rank · water drop = urgency keyword · colored circles = scheduled stops by technician (✓ = finished) · hover a route line for its drive time'));
   return el;
 }

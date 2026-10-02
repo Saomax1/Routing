@@ -1,5 +1,5 @@
 """
-"Scheduled outside the window" notes.
+"Deadline waived" notes.
 
 The deadline rules (Admin > Settings) are targets, not hard limits: a customer may not be available, or there may
 be another good reason to book a job later. A dispatcher records that here so the job stops showing as overdue,
@@ -47,7 +47,7 @@ def set_exception(conn, job_id: str, reason, note, user_id: Optional[int]) -> Op
     if not job:
         return None
     if job["work_status"] != "unscheduled":
-        raise ValueError("Only unscheduled jobs can be marked as scheduled outside the window")
+        raise ValueError("Only unscheduled jobs can have their deadline waived")
     if not isinstance(reason, str) or reason not in REASONS:
         raise ValueError("Choose a reason: " + ", ".join(REASONS.values()))
     if note is not None and not isinstance(note, str):

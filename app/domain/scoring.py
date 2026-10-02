@@ -9,7 +9,7 @@ Priority scoring for unscheduled jobs (spec 7.4).
 Every component is returned in ``breakdown`` so dispatchers can see *why* a job ranks where it does.
 All weights and deadline rules come from settings (Admin > Settings); nothing is hard-coded here.
 
-Deadlines are targets, not hard limits. A job a dispatcher has marked "scheduled outside the window"
+Deadlines are targets, not hard limits. A job whose deadline a dispatcher has waived
 (``exception``) keeps its deadline time for reference but is reported as ``excused``: no deadline points and
 it never counts as overdue.
 """
@@ -90,7 +90,7 @@ def score_job(job: dict, warranty: Optional[dict], settings: dict, now: datetime
     status = deadline_status(fraction_left, remaining_h)
     if exception and status != "none":
         status = "excused"
-        breakdown.append({"label": f"Outside the window: {exception.get('reason_label') or 'excused'} (no deadline points)",
+        breakdown.append({"label": f"Deadline waived: {exception.get('reason_label') or 'excused'} (no deadline points)",
                           "points": 0.0})
     dp = sc["deadline_points"].get(status, 0)
     if dp:

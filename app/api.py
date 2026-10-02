@@ -171,7 +171,8 @@ def app_config(ctx: Ctx, _):
     return {"mode": ctx.cfg.hcp_mode, "geocoder": ctx.cfg.geocoder, "timezone": s["timezone"],
             "today": now_utc().astimezone(tz).date().isoformat(), "map": s["map"],
             "sync_interval_seconds": ctx.cfg.sync_interval_seconds, "llm_enabled": ctx.cfg.llm_enabled,
-            "exception_reasons": reason_options(), "routing": {"provider": ctx.app.state.routes.name}}
+            "exception_reasons": reason_options(), "routing": {"provider": ctx.app.state.routes.name},
+            "scheduling": {k: s["scheduling"][k] for k in ("window_minutes", "window_step_minutes", "stack_within_minutes")}}
 
 
 # ------------------------------------------------------------------------ dispatch
@@ -202,8 +203,11 @@ def job_slots(ctx: Ctx, body):
     days = body.get("days")
     if days is not None and (not isinstance(days, int) or isinstance(days, bool) or not 1 <= days <= 14):
         raise ApiError(400, "days must be an integer from 1 to 14")
+    window = body.get("window_minutes")
+    if window is not None and (not isinstance(window, int) or isinstance(window, bool) or not 15 <= window <= 720):
+        raise ApiError(400, "window_minutes must be an integer from 15 to 720")
     with ctx.db.session() as conn:
-        res = compute_slots(conn, ctx.path["job_id"], get_settings(conn), now_utc(), days)
+        res = compute_slots(conn, ctx.path["job_id"], get_settings(conn), now_utc(), days, window)
     if res is None:
         raise ApiError(404, "Job not found")
     return res
@@ -259,7 +263,7 @@ def areas(ctx: Ctx, _):
 
 @endpoint(body=True)
 def exception_put(ctx: Ctx, body):
-    """Mark an unscheduled job as being scheduled outside its deadline window (local note, nothing goes to HCP)."""
+    """Waive an unscheduled job's deadline, with a reason (a local note: nothing goes to HCP)."""
     with ctx.db.session() as conn:
         exc = set_exception(conn, ctx.path["job_id"], body.get("reason"), body.get("note"), ctx.user["id"])
     if exc is None:
@@ -271,7 +275,7 @@ def exception_put(ctx: Ctx, body):
 def exception_delete(ctx: Ctx, _):
     with ctx.db.session() as conn:
         if not clear_exception(conn, ctx.path["job_id"]):
-            raise ApiError(404, "That job is not marked as outside the window")
+            raise ApiError(404, "That job's deadline is not waived")
     return {"ok": True}
 
 

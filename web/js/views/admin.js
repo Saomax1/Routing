@@ -163,6 +163,11 @@ export function mountSettings(root, ctx) {
             num('scheduling.day_penalty_minutes.Emergency', 'Delay penalty / day: Emergency'), num('scheduling.day_penalty_minutes.Expedited', 'Delay penalty / day: Expedited'),
             num('scheduling.day_penalty_minutes.Normal', 'Delay penalty / day: Normal'), num('scheduling.day_penalty_minutes.Direct', 'Delay penalty / day: Direct'),
             num('scheduling.deadline_miss_penalty', 'Penalty if past deadline')),
+          h('div', { class: 'grid' },
+            num('scheduling.window_minutes', 'Standard arrival window (minutes)', { min: 15, help: '240 = 4 hours. Dispatchers can change it for one job on its card.' }),
+            num('scheduling.window_step_minutes', 'Windows start every (minutes)', { min: 5, help: '60 = on the hour: 8-12, 9-1, 10-2.' }),
+            num('scheduling.stack_within_minutes', 'Offer the same window within (min drive)', { min: 0, help: 'A job this close to another is suggested into its window. 0 turns it off.' })),
+          note('Customers are given an arrival window, not a time. Windows are allowed to overlap (job 1 8-12, job 2 10-2), which gives the technician slack when a job runs long.'),
           note('The delay penalty is "minutes of extra driving you would accept to get the job done one day sooner". A high value for Emergency makes it prefer today.')),
           sec('Job durations', note('Longest matching keyword wins, then the trade default. Used for new jobs and for scheduled jobs that have no end time.'), durationEditor()),
           sec('Mapping & links', h('div', { class: 'grid' }, txt('timezone', 'Company timezone', 'IANA name, e.g. America/Phoenix'),
@@ -222,7 +227,7 @@ export function mountUsers(root, ctx) {
         e.preventDefault();
         try { await api.createUser({ email: email.value, name: name.value, password: pw.value, role: role.value }); toast('User created', 'ok'); load(); } catch (err) { toast(err.message, 'error', 6000); }
       } }, h('h2', {}, 'Add a user'), h('div', { class: 'grid' }, field('Email', email), field('Name', name), field('Password (10+ characters)', pw), field('Role', role)), h('button', { class: 'btn primary', type: 'submit' }, 'Create user'));
-      render(page, h('h1', {}, 'Users'), note('Dispatchers can view the map, areas, job cards and slot suggestions, run syncs, and mark a job as scheduled outside its deadline window. Admins can also change technicians, settings and users.'),
+      render(page, h('h1', {}, 'Users'), note('Dispatchers can view the map, areas, job cards and slot suggestions, run syncs, and waive a job’s deadline. Admins can also change technicians, settings and users.'),
         h('section', { class: 'card' }, h('table', { class: 'tbl' }, h('thead', {}, h('tr', {}, h('th', {}, 'Email'), h('th', {}, 'Name'), h('th', {}, 'Role'), h('th'))),
           h('tbody', {}, users.map((u) => h('tr', {}, h('td', {}, u.email), h('td', {}, u.name), h('td', {}, h('span', { class: `chip ${u.role === 'admin' ? 'ok' : 'dim'}` }, u.role)),
             h('td', {}, u.id === ctx.user.id ? h('span', { class: 'dim' }, 'you') : h('button', { class: 'btn', type: 'button', onclick: async () => { if (!confirm(`Delete ${u.email}?`)) return; try { await api.deleteUser(u.id); load(); } catch (err) { toast(err.message, 'error'); } } }, 'Delete'))))))),

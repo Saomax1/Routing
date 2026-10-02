@@ -142,6 +142,7 @@ def normalize_job(raw: dict) -> dict:
     except (TypeError, ValueError):
         lat = lng = None
 
+    # arrival_window = minutes after scheduled_start in which the technician may arrive (the promise to the customer)
     window = pick(raw, "schedule.arrival_window", "schedule.arrival_window_minutes", "arrival_window")
     try:
         window = int(window) if window is not None else None
@@ -154,6 +155,7 @@ def normalize_job(raw: dict) -> dict:
         "scheduled_start": to_iso(parse_iso(pick(raw, "schedule.scheduled_start", "scheduled_start"))),
         "scheduled_end": to_iso(parse_iso(pick(raw, "schedule.scheduled_end", "scheduled_end"))),
         "arrival_window_minutes": window,
+        "completed_at": to_iso(parse_iso(pick(raw, "work_timestamps.completed_at", "completed_at"))),
         "assigned_employee_ids": assigned_ids,
         "customer_name": _full_name(cust),
         "customer_phone": str(pick(cust, "mobile_number", "home_number", "work_number", "phone", default="")),

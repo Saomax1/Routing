@@ -63,7 +63,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   source_category TEXT NOT NULL DEFAULT 'direct', -- ahs | other_warranty | direct
   description_raw TEXT NOT NULL DEFAULT '',
   description_hash TEXT NOT NULL DEFAULT '',
-  hcp_created_at TEXT, hcp_updated_at TEXT, last_synced_at TEXT
+  hcp_created_at TEXT, hcp_updated_at TEXT, last_synced_at TEXT,
+  completed_at TEXT                               -- when HCP says the work was completed (work_status = 'complete')
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(work_status, active);
 CREATE INDEX IF NOT EXISTS idx_jobs_sched ON jobs(scheduled_start);
@@ -83,7 +84,7 @@ CREATE TABLE IF NOT EXISTS warranty_details (
   parsed_at TEXT
 );
 
-CREATE TABLE IF NOT EXISTS job_exceptions (         -- dispatcher says: "scheduling this one outside its deadline window"
+CREATE TABLE IF NOT EXISTS job_exceptions (         -- dispatcher says: "waive this one's deadline"
   hcp_job_id TEXT PRIMARY KEY REFERENCES jobs(hcp_job_id) ON DELETE CASCADE,
   reason TEXT NOT NULL,                             -- a code from services/job_exceptions.REASONS
   note TEXT NOT NULL DEFAULT '',
@@ -132,6 +133,13 @@ CREATE TABLE IF NOT EXISTS sync_runs (
 """
 
 
+# Columns added after the first release. CREATE TABLE IF NOT EXISTS never touches an existing table, so a database
+# created by an older version gets them here (one ALTER per missing column, safe to run on every start).
+MIGRATIONS = [
+    ("jobs", "completed_at", "TEXT"),
+]
+
+
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -168,6 +176,10 @@ class Database:
             if self.path != ":memory:":
                 conn.execute("PRAGMA journal_mode = WAL")
             conn.executescript(SCHEMA)
+            for table, column, ddl in MIGRATIONS:
+                have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+                if column not in have:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
             conn.commit()
         finally:
             conn.close()

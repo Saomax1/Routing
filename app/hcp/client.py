@@ -4,12 +4,13 @@ Housecall Pro clients.
 ``HCPClient``      - live calls (read-only in this phase; write-back arrives in Phase 2)
 ``MockHCPClient``  - serves sanitized demo data, no network (HCP_MODE=mock, the default)
 
-Both expose the same three read methods, returning RAW HCP-shaped dicts which
+Both expose the same read methods, returning RAW HCP-shaped dicts which
 ``normalize.normalize_job`` / ``normalize_employee`` then flatten:
 
     list_employees()                       -> [raw employee]
     list_unscheduled()                     -> [raw job]
-    list_scheduled(start_date, end_date)   -> [raw job]
+    list_scheduled(start_date, end_date)   -> [raw job]   (scheduled + in progress)
+    list_completed(start_date, end_date)   -> [raw job]   (complete rated / unrated)
 
 !!  Endpoint paths, query-parameter names and the auth scheme are UNVERIFIED (see normalize.py).
 !!  They are isolated in the constants below. ``scripts/phase0_probe.py`` exercises them against your
@@ -28,6 +29,7 @@ from ..config import Config
 from ..domain.timeutil import parse_iso, to_iso
 from .fixtures import make_demo_dataset
 from .http import UrllibTransport
+from .normalize import canonical_work_status
 
 log = logging.getLogger("routing.hcp")
 
@@ -37,6 +39,8 @@ EMPLOYEES_PATH = "/employees"
 PARAM_PAGE = "page"
 PARAM_PAGE_SIZE = "page_size"
 PARAM_WORK_STATUS = "work_status[]"
+STATUS_OPEN_SCHEDULED = ("scheduled", "in progress")
+STATUS_COMPLETED = ("complete rated", "complete unrated")
 PARAM_SCHED_MIN = "scheduled_start_min"
 PARAM_SCHED_MAX = "scheduled_start_max"
 LIST_KEYS = {"jobs": ("jobs", "data", "items", "results"), "employees": ("employees", "data", "items", "results")}
@@ -99,8 +103,16 @@ class HCPClient:
         tz = tz or ZoneInfo("UTC")
         lo = datetime.combine(start, time(0, 0), tzinfo=tz)
         hi = datetime.combine(end + timedelta(days=1), time(0, 0), tzinfo=tz)
-        return self._paged(JOBS_PATH, "jobs", [(PARAM_WORK_STATUS, "scheduled"),
-                                               (PARAM_SCHED_MIN, to_iso(lo)), (PARAM_SCHED_MAX, to_iso(hi))])
+        return self._paged(JOBS_PATH, "jobs", [(PARAM_WORK_STATUS, s) for s in STATUS_OPEN_SCHEDULED]
+                           + [(PARAM_SCHED_MIN, to_iso(lo)), (PARAM_SCHED_MAX, to_iso(hi))])
+
+    def list_completed(self, start: date, end: date, tz: Optional[ZoneInfo] = None) -> List[dict]:
+        """Jobs HCP has marked complete whose scheduled start falls in [start, end]."""
+        tz = tz or ZoneInfo("UTC")
+        lo = datetime.combine(start, time(0, 0), tzinfo=tz)
+        hi = datetime.combine(end + timedelta(days=1), time(0, 0), tzinfo=tz)
+        return self._paged(JOBS_PATH, "jobs", [(PARAM_WORK_STATUS, s) for s in STATUS_COMPLETED]
+                           + [(PARAM_SCHED_MIN, to_iso(lo)), (PARAM_SCHED_MAX, to_iso(hi))])
 
     # ---- writes: Phase 2 (explicit dispatcher action + confirmation only) ----
     def set_schedule(self, *a, **k):
@@ -125,16 +137,22 @@ class MockHCPClient:
     def list_unscheduled(self) -> List[dict]:
         return [j for j in self.dataset["jobs"] if j["work_status"] == "unscheduled"]
 
-    def list_scheduled(self, start: date, end: date, tz: Optional[ZoneInfo] = None) -> List[dict]:
+    def _in_range(self, statuses: tuple, start: date, end: date, tz: Optional[ZoneInfo]) -> List[dict]:
         tz = tz or ZoneInfo("America/Phoenix")
         out = []
         for j in self.dataset["jobs"]:
-            if j["work_status"] != "scheduled":
+            if canonical_work_status(j["work_status"]) not in statuses:
                 continue
-            s = parse_iso(j["schedule"]["scheduled_start"])
+            s = parse_iso((j.get("schedule") or {}).get("scheduled_start"))
             if s and start <= s.astimezone(tz).date() <= end:
                 out.append(j)
         return out
+
+    def list_scheduled(self, start: date, end: date, tz: Optional[ZoneInfo] = None) -> List[dict]:
+        return self._in_range(("scheduled", "in_progress"), start, end, tz)
+
+    def list_completed(self, start: date, end: date, tz: Optional[ZoneInfo] = None) -> List[dict]:
+        return self._in_range(("complete",), start, end, tz)
 
     def set_schedule(self, *a, **k):
         raise NotImplementedError("Write-back is Phase 2.")

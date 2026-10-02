@@ -115,9 +115,14 @@ def _stop(job: dict, warranty: Optional[dict], seq: int, tz: ZoneInfo, settings:
     else:
         e_min = min(24 * 60, s_min + estimate_minutes(job["trade_code"], job_text(job, warranty), durations,
                                                       settings["scheduling"]["default_duration_minutes"]))
+    # Arrival window = the promise to the customer: from the scheduled start for `arrival_window_minutes` (HCP's own
+    # value, else the standard window). The scheduled end is the job's duration, not the window.
+    win = int(job.get("arrival_window_minutes") or settings["scheduling"]["window_minutes"])
     return {
         "id": job["hcp_job_id"], "seq": seq, "lat": job["lat"], "lng": job["lng"],
         "start_iso": job["scheduled_start"], "end_iso": job["scheduled_end"], "start_min": s_min, "end_min": e_min,
+        "window_start_min": s_min, "window_end_min": min(24 * 60, s_min + win), "window_minutes": win,
+        "completed_iso": job.get("completed_at"),
         "customer_name": job["customer_name"], "address": address_line(job), "trade_code": job["trade_code"],
         "source_category": job["source_category"], "status": job["work_status"],
         "priority_label": (warranty or {}).get("dispatch_priority") or "",
@@ -142,7 +147,7 @@ def build_dispatch(conn, d: date, settings: dict, now: datetime) -> dict:
 
     day_lo, day_hi = to_iso(at_local_minutes(d, 0, tz)), to_iso(at_local_minutes(d + timedelta(days=1), 0, tz))
     scheduled = [job_dict(r) for r in conn.execute(
-        "SELECT * FROM jobs WHERE active = 1 AND work_status IN ('scheduled','in_progress') "
+        "SELECT * FROM jobs WHERE active = 1 AND work_status IN ('scheduled','in_progress','complete') "
         "AND scheduled_start >= ? AND scheduled_start < ? ORDER BY scheduled_start", (day_lo, day_hi))]
 
     by_tech: Dict[str, List[dict]] = {}
@@ -167,6 +172,7 @@ def build_dispatch(conn, d: date, settings: dict, now: datetime) -> dict:
         tech_out.append({
             "id": t["id"], "name": t["name"], "color": t["color"], "active": t["active"],
             "trade_skills": t["trade_skills"], "home": home, "stops": stops, "job_count": len(stops),
+            "done_count": sum(1 for s in stops if s["status"] == "complete"),
             "needs_setup": t["active"] and (not t["trade_skills"] or home is None),
             **_route_totals(home, stops, travel),
         })
@@ -188,7 +194,9 @@ def build_dispatch(conn, d: date, settings: dict, now: datetime) -> dict:
         "now": to_iso(now), "technicians": tech_out, "unassigned_scheduled": unassigned, "unscheduled": uns,
         "stats": {
             "unscheduled": len(uns), "unmapped": sum(1 for u in uns if u["lat"] is None),
-            "scheduled_today": sum(t["job_count"] for t in tech_out) + len(unassigned),
+            "scheduled_today": sum(t["job_count"] - t["done_count"] for t in tech_out)
+            + sum(1 for s in unassigned if s["status"] != "complete"),
+            "completed_today": sum(t["done_count"] for t in tech_out) + sum(1 for s in unassigned if s["status"] == "complete"),
             "overdue": sum(1 for u in uns if u["deadline_status"] == "overdue"),
         },
         "last_sync": None if not last else {k: last[k] for k in ("started_at", "finished_at", "status", "mode",
@@ -251,7 +259,7 @@ def build_schedule(conn, days: List[date], settings: dict, durations: list, wmap
     lo, hi = to_iso(at_local_minutes(days[0], 0, tz)), to_iso(at_local_minutes(days[-1] + timedelta(days=1), 0, tz))
     schedule: Schedule = {}
     unlocated = 0
-    for r in conn.execute("SELECT * FROM jobs WHERE active = 1 AND work_status IN ('scheduled','in_progress') "
+    for r in conn.execute("SELECT * FROM jobs WHERE active = 1 AND work_status IN ('scheduled','in_progress','complete') "
                           "AND scheduled_start >= ? AND scheduled_start < ?", (lo, hi)):
         j = job_dict(r)
         start = parse_iso(j["scheduled_start"])
@@ -264,17 +272,21 @@ def build_schedule(conn, days: List[date], settings: dict, durations: list, wmap
         for tid in j["assigned_employee_ids"]:
             schedule.setdefault((tid, d), []).append(
                 {"id": stop["id"], "lat": stop["lat"], "lng": stop["lng"], "start_min": stop["start_min"],
-                 "end_min": stop["end_min"], "label": stop["customer_name"]})
+                 "end_min": stop["end_min"], "label": stop["customer_name"], "state": stop["status"],
+                 "win_start_min": stop["window_start_min"], "win_end_min": stop["window_end_min"]})
     return schedule, unlocated
 
 
-def compute_slots(conn, job_id: str, settings: dict, now: datetime, search_days: Optional[int] = None) -> Optional[dict]:
+def compute_slots(conn, job_id: str, settings: dict, now: datetime, search_days: Optional[int] = None,
+                  window_minutes: Optional[int] = None) -> Optional[dict]:
     r = conn.execute("SELECT * FROM jobs WHERE hcp_job_id = ?", (job_id,)).fetchone()
     if not r:
         return None
     job = job_dict(r)
     if job["work_status"] != "unscheduled":
         raise ValueError("Slots can only be suggested for unscheduled jobs")
+    if window_minutes is not None and not 15 <= window_minutes <= 720:
+        raise ValueError("The arrival window must be between 15 minutes and 12 hours")
     tz = _tz(settings)
     n_days = max(1, min(14, int(search_days or settings["scheduling"]["search_days"])))
     today = now.astimezone(tz).date()
@@ -290,9 +302,10 @@ def compute_slots(conn, job_id: str, settings: dict, now: datetime, search_days:
     result = find_best_slots(
         {"id": job_id, "lat": job["lat"], "lng": job["lng"], "trade_code": job["trade_code"]},
         load_technicians(conn), schedule, HaversineTravel.from_settings(settings), settings, now, days, duration, tz,
-        priority_label=sc["priority_label"], deadline_at=None if excused else parse_iso(sc["deadline_at"]))
+        priority_label=sc["priority_label"], deadline_at=None if excused else parse_iso(sc["deadline_at"]),
+        window_min=window_minutes)
     if excused:
-        result["notes"].append(f"Marked as scheduled outside the window ({sc['exception']['reason_label']}), "
+        result["notes"].append(f"Deadline waived ({sc['exception']['reason_label']}), "
                                "so the deadline is not used to rank these options.")
     if unlocated:
         result["notes"].append(f"{unlocated} scheduled stop(s) have no map location, so drive time to/from them is "
@@ -362,11 +375,13 @@ def build_areas(conn, settings: dict, now: datetime, search_days: Optional[int] 
             t = a["_techs"].setdefault(o["tech_id"], {
                 "tech_id": o["tech_id"], "name": o["tech_name"], "color": o["tech_color"], "date": o["date"],
                 "start_min": o["start_min"], "start_iso": o["start_iso"], "added_drive_min": o["added_drive_min"],
+                "window_start_min": o["window_start_min"], "window_end_min": o["window_end_min"],
                 "job_id": jid, "eligible_jobs": 0})
             t["eligible_jobs"] += 1
             if (o["date"], o["start_min"]) < (t["date"], t["start_min"]):
                 t.update(date=o["date"], start_min=o["start_min"], start_iso=o["start_iso"],
-                         added_drive_min=o["added_drive_min"], job_id=jid)
+                         added_drive_min=o["added_drive_min"], job_id=jid,
+                         window_start_min=o["window_start_min"], window_end_min=o["window_end_min"])
 
     out = []
     for a in areas.values():

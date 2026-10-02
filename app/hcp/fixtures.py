@@ -215,8 +215,15 @@ def make_demo_dataset(now: Optional[datetime] = None, tz_name: str = "America/Ph
                     desc = rng.choice(descriptions[trade])
                     lead, tags = rng.choice(["Google LSA", "Referral", "Repeat customer"]), []
                 created = start_local - timedelta(days=rng.randint(2, 6))
+                # earlier today: done or under way, like a real day in HCP (rng use is unchanged)
+                if end_local <= now:
+                    status, stamps = "complete rated", {"completed_at": _iso(end_local)}
+                elif start_local <= now:
+                    status, stamps = "in progress", {}
+                else:
+                    status, stamps = "scheduled", {}
                 jobs.append({
-                    "id": job_id, "work_status": "scheduled", "description": desc,
+                    "id": job_id, "work_status": status, "work_timestamps": stamps, "description": desc,
                     "customer": _customer(rng, jid), "address": address_for(city, street, zip_code),
                     "schedule": {"scheduled_start": _iso(start_local), "scheduled_end": _iso(end_local),
                                  "arrival_window": 60},
@@ -273,5 +280,33 @@ def make_demo_dataset(now: Optional[datetime] = None, tz_name: str = "America/Ph
     unscheduled("Mesa", "PLB", "Normal", [], 30, lead="Choice Home Warranty", tags=["warranty"],
                 plain_desc="Choice Home Warranty authorization #CHW-555-0101. Toilet leaking at base. Collect $85 trade fee.",
                 job_type="Plumbing")
+
+    # ---- completed history: the previous workday, so the date picker has finished routes to show.
+    # Own rng: adding these must not change any job generated above.
+    hist = random.Random(20261002)
+    prev = local_today - timedelta(days=1)
+    while prev.weekday() >= 5:
+        prev -= timedelta(days=1)
+    for e in EMPLOYEES:
+        if not e["active"]:
+            continue
+        for s_i, (hh, mm, dur) in enumerate(slots[:2]):
+            city = area_cities[e["id"]][s_i % len(area_cities[e["id"]])]
+            zip_code = hist.choice(CITY_CENTERS[city][2])
+            street = _street(hist)
+            trade = e["skills"][s_i % len(e["skills"])]
+            start_local = datetime.combine(prev, time(hh, mm), tzinfo=tz)
+            end_local = start_local + timedelta(minutes=dur)
+            jobs.append({
+                "id": next_id(), "work_status": "complete rated" if s_i == 0 else "complete unrated",
+                "work_timestamps": {"completed_at": _iso(end_local + timedelta(minutes=hist.randint(0, 20)))},
+                "description": hist.choice(descriptions[trade]),
+                "customer": _customer(hist, jid), "address": address_for(city, street, zip_code),
+                "schedule": {"scheduled_start": _iso(start_local), "scheduled_end": _iso(end_local), "arrival_window": 60},
+                "assigned_employees": [{"id": e["id"], "first_name": e["first_name"], "last_name": e["last_name"]}],
+                "tags": [], "lead_source": "Repeat customer",
+                "job_fields": {"job_type": {"name": "Plumbing" if trade == "PLB" else "HVAC"}},
+                "created_at": _iso(start_local - timedelta(days=3)), "updated_at": _iso(end_local),
+            })
 
     return {"employees": employees, "jobs": jobs}

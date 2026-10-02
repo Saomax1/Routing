@@ -212,7 +212,7 @@ class ExceptionApiTests(ApiBase):
             self.assertNotIn("away until", str(after))                  # the note itself stays out of the queue payload
             self.assertEqual(after["stats"]["overdue"], before["stats"]["overdue"] - 1)
             slots = self.disp.post(f"/api/jobs/{jid}/slots", {"days": 5}).json()
-            self.assertTrue(any("outside the window" in n for n in slots["notes"]))
+            self.assertTrue(any("Deadline waived" in n for n in slots["notes"]))
         finally:
             self.assertEqual(self.disp.delete(f"/api/jobs/{jid}/exception").status, 200)
         self.assertEqual(self.disp.delete(f"/api/jobs/{jid}/exception").status, 404)
@@ -245,6 +245,83 @@ class ExceptionApiTests(ApiBase):
         self.assertEqual(c.delete(f"/api/jobs/{jid}/exception", csrf=False).status, 403)
 
 
+class WindowApiTests(ApiBase):
+    def top_job(self):
+        return next(u["id"] for u in self.disp.get("/api/dispatch").json()["unscheduled"] if u["lat"] is not None)
+
+    def test_config_tells_the_page_the_window_defaults(self):
+        self.assertEqual(self.disp.get("/api/config").json()["scheduling"],
+                         {"window_minutes": 240, "window_step_minutes": 60, "stack_within_minutes": 20})
+
+    def test_slots_come_with_a_window_and_the_search_can_change_its_length(self):
+        jid = self.top_job()
+        res = self.disp.post(f"/api/jobs/{jid}/slots", {"days": 7}).json()
+        self.assertEqual(res["window_minutes"], 240)
+        for o in res["options"]:
+            for k in ("window_start_min", "window_end_min", "window_start_iso", "window_end_iso", "stacked_with", "origin"):
+                self.assertIn(k, o)
+            self.assertTrue(o["window_start_min"] <= o["start_min"] <= o["window_end_min"])
+            self.assertLessEqual(o["window_minutes"], 240)
+        short = self.disp.post(f"/api/jobs/{jid}/slots", {"days": 7, "window_minutes": 120}).json()
+        self.assertEqual(short["window_minutes"], 120)
+        self.assertTrue(short["options"])
+        self.assertTrue(all(o["window_minutes"] <= 120 for o in short["options"]))
+
+    def test_window_minutes_is_validated(self):
+        jid = self.top_job()
+        for bad in (0, 14, 721, -60, "240", True, 2.5, [240]):
+            self.assertEqual(self.disp.post(f"/api/jobs/{jid}/slots", {"window_minutes": bad}).status, 400, bad)
+        for good in (15, 60, 480, 720):
+            self.assertEqual(self.disp.post(f"/api/jobs/{jid}/slots", {"window_minutes": good}).status, 200, good)
+
+    def test_an_admin_can_change_the_standard_window_and_it_is_used_by_default(self):
+        jid = self.top_job()
+        try:
+            r = self.admin.put("/api/settings", {"settings": {"scheduling": {"window_minutes": 180, "stack_within_minutes": 30}}})
+            self.assertEqual(r.status, 200, r.text)
+            self.assertEqual(self.disp.get("/api/config").json()["scheduling"]["window_minutes"], 180)
+            self.assertEqual(self.disp.post(f"/api/jobs/{jid}/slots", {"days": 3}).json()["window_minutes"], 180)
+            self.assertEqual(self.disp.post(f"/api/jobs/{jid}/slots", {"days": 3, "window_minutes": 300}).json()["window_minutes"], 300)
+            for bad in ({"window_minutes": 5}, {"window_minutes": 9999}, {"window_step_minutes": 0}, {"stack_within_minutes": -5}):
+                self.assertEqual(self.admin.put("/api/settings", {"settings": {"scheduling": bad}}).status, 400, bad)
+            self.assertEqual(self.disp.put("/api/settings", {"settings": {"scheduling": {"window_minutes": 60}}}).status, 403)
+        finally:
+            self.admin.put("/api/settings", {"settings": {"scheduling": {"window_minutes": 240, "stack_within_minutes": 20}}})
+        self.assertEqual(self.disp.get("/api/config").json()["scheduling"]["window_minutes"], 240)
+
+    def test_dispatch_stops_carry_their_window_and_status(self):
+        today = self.disp.get("/api/config").json()["today"]
+        d = self.disp.get("/api/dispatch?date=" + self._next_workday(today)).json()     # the demo has no jobs on weekends
+        stops = [s for t in d["technicians"] for s in t["stops"]]
+        self.assertTrue(stops)
+        for s in stops:
+            for k in ("status", "window_start_min", "window_end_min", "window_minutes", "completed_iso"):
+                self.assertIn(k, s)
+            self.assertIn(s["status"], ("scheduled", "in_progress", "complete"))
+        for t in d["technicians"]:
+            self.assertIn("done_count", t)
+        for k in ("scheduled_today", "completed_today"):
+            self.assertIn(k, d["stats"])
+        past = self.disp.get("/api/dispatch?date=" + self._previous_workday(today)).json()
+        self.assertGreater(past["stats"]["completed_today"], 0)                 # yesterday's route is still there, done
+
+    @staticmethod
+    def _next_workday(today):
+        from datetime import date, timedelta
+        d = date.fromisoformat(today)
+        while d.weekday() >= 5:
+            d += timedelta(days=1)
+        return d.isoformat()
+
+    @staticmethod
+    def _previous_workday(today):
+        from datetime import date, timedelta
+        d = date.fromisoformat(today) - timedelta(days=1)
+        while d.weekday() >= 5:
+            d -= timedelta(days=1)
+        return d.isoformat()
+
+
 class AreasApiTests(ApiBase):
     def test_areas_shape_and_totals(self):
         r = self.disp.get("/api/areas")
@@ -260,6 +337,11 @@ class AreasApiTests(ApiBase):
         self.assertNotIn("_techs", r.text)
         # every queue entry carries the key the Areas tab and the queue filter use
         self.assertTrue({u["area_key"] for u in queue} <= {x["key"] for x in res["areas"]})
+
+    def test_openings_show_the_arrival_window(self):
+        for a in self.disp.get("/api/areas?days=7").json()["areas"]:
+            for t in a["techs"]:
+                self.assertTrue(t["window_start_min"] <= t["start_min"] <= t["window_end_min"], t)
 
     def test_days_parameter(self):
         self.assertEqual(self.disp.get("/api/areas?days=7").json()["days"], 7)

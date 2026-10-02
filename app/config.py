@@ -75,6 +75,7 @@ class Config:
     sync_interval_seconds: int = 300
     sync_on_startup: bool = True
     scheduled_window_days: int = 14
+    completed_lookback_days: int = 3     # how far back each sync looks for jobs HCP has marked complete
 
     host: str = "127.0.0.1"
     port: int = 8000
@@ -122,6 +123,7 @@ def load_config() -> Config:
         sync_interval_seconds=_env_int("SYNC_INTERVAL_SECONDS", 300),
         sync_on_startup=_env_bool("SYNC_ON_STARTUP", True),
         scheduled_window_days=_env_int("SCHEDULED_WINDOW_DAYS", 14),
+        completed_lookback_days=max(0, _env_int("COMPLETED_LOOKBACK_DAYS", 3)),
         host=_env("HOST", "127.0.0.1"),
         port=_env_int("PORT", 8000),
         env=_env("APP_ENV", "development").lower(),

@@ -2,10 +2,11 @@
 Housecall Pro -> local database sync (spec 4.3).
 
 Every run:
-  1. pulls employees, ALL unscheduled jobs, and scheduled jobs for today .. today+window days
+  1. pulls employees, ALL unscheduled jobs, scheduled / in-progress jobs for today .. today+window days, and
+     jobs HCP has marked COMPLETE over the last few days (they stay on the map as done, work_status = 'complete')
   2. for each job: normalise, parse warranty text (only if the description changed), geocode
      (cached; only if the address changed), upsert
-  3. marks jobs HCP no longer returns (inside our window) as inactive so they leave the map
+  3. marks open jobs HCP no longer returns (inside our window) as inactive so they leave the map
 
 Design notes
 * Read-only against HCP in this phase.
@@ -81,6 +82,14 @@ class SyncService:
             log.error("sync failed fetching from HCP: %s", msg)
             self._finish(run_id, "error", 0, 0, msg)
             return {"status": "error", "error": msg}
+        # Completed jobs are a separate call so a problem with it (the HCP status names are unverified) never
+        # costs us the rest of the sync: jobs just stay as they were until the call works.
+        completed, completed_error = [], None
+        try:
+            completed = self.hcp.list_completed(today - timedelta(days=self.cfg.completed_lookback_days), today, tz)
+        except Exception as e:
+            completed_error = type(e).__name__
+            log.warning("sync: could not fetch completed jobs (%s)", completed_error)
 
         window_lo = to_iso(at_local_minutes(today, 0, tz))
         window_hi = to_iso(at_local_minutes(end + timedelta(days=1), 0, tz))
@@ -90,7 +99,7 @@ class SyncService:
         try:
             self._sync_employees(conn, employees)
             conn.commit()
-            for raw in list(unscheduled) + list(scheduled):
+            for raw in list(unscheduled) + list(scheduled) + list(completed):
                 try:
                     n = normalize_job(raw)
                     if not n["hcp_job_id"]:
@@ -109,9 +118,9 @@ class SyncService:
                         conn.commit()
                     except Exception:
                         conn.rollback()
-            # deactivate what HCP no longer returns inside our window
+            # deactivate what HCP no longer returns inside our window (completed jobs are history: they stay)
             for r in conn.execute("SELECT hcp_job_id, work_status, scheduled_start FROM jobs WHERE active = 1").fetchall():
-                if r["hcp_job_id"] in seen:
+                if r["hcp_job_id"] in seen or r["work_status"] == "complete":
                     continue
                 in_window = r["work_status"] == "unscheduled" or (
                     r["scheduled_start"] and window_lo <= r["scheduled_start"] < window_hi)
@@ -126,6 +135,8 @@ class SyncService:
         note = []
         if errors:
             note.append(f"{errors} job(s) could not be processed")
+        if completed_error:
+            note.append(f"completed jobs could not be fetched ({completed_error})")
         if getattr(self.hcp, "truncated", False):
             note.append("HCP result list was truncated at the page cap")
         self._finish(run_id, status, len(seen), changed, "; ".join(note) or None)
@@ -217,6 +228,9 @@ class SyncService:
             "hcp_job_id": jid, "work_status": n["work_status"], "active": 1,
             "scheduled_start": n["scheduled_start"], "scheduled_end": n["scheduled_end"],
             "arrival_window_minutes": n["arrival_window_minutes"],
+            # when HCP does not say, a completed job's last update / scheduled end is the best guess
+            "completed_at": (n["completed_at"] or n["hcp_updated_at"] or n["scheduled_end"])
+            if n["work_status"] == "complete" else None,
             "assigned_employee_ids": jdump(n["assigned_employee_ids"]),
             "customer_name": n["customer_name"] or (wdata or {}).get("contact_name") or "",
             "customer_phone": n["customer_phone"] or (((wdata or {}).get("contact_phones") or [""])[0]),
@@ -228,7 +242,8 @@ class SyncService:
             "hcp_created_at": n["hcp_created_at"], "hcp_updated_at": n["hcp_updated_at"],
             "last_synced_at": utcnow_iso(),
         }
-        compare = ("work_status", "active", "scheduled_start", "scheduled_end", "assigned_employee_ids", "street", "city",
+        compare = ("work_status", "active", "scheduled_start", "scheduled_end", "arrival_window_minutes",
+                   "completed_at", "assigned_employee_ids", "street", "city",
                    "zip", "lat", "lng", "lead_source", "tags", "description_hash", "hcp_updated_at", "trade_code",
                    "source_category", "customer_name")
         changed = existing is None or any(existing[k] != row[k] for k in compare)

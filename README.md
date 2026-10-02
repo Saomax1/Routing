@@ -38,8 +38,8 @@ touches real data).
 python -m unittest discover -s tests -t .
 ```
 
-183 tests cover the warranty parser, scoring, travel and slot engines, deadline exceptions, area totals, road routing,
-the sync pipeline and the API (auth, roles, CSRF, rate limiting). All fixtures are sanitized fake data. The suite uses
+232 tests cover the warranty parser, scoring, travel and slot engines, arrival windows, completed jobs, deadline
+exceptions, area totals, road routing, the sync pipeline and the API (auth, roles, CSRF, rate limiting). All fixtures are sanitized fake data. The suite uses
 only the standard library `unittest`.
 
 ## Connecting to your real Housecall Pro account
@@ -63,8 +63,10 @@ auth header, `/jobs` and `/employees` paths, query parameter names, and where th
    `mock`, pins only land on city centers.
    **Pick a road router** too (`ROUTER`, see below): with live data it is off until you choose, because it sends each
    stop's coordinates to the routing provider.
-4. Set `HCP_MODE=live`, `HCP_API_KEY=...`, restart. The first sync pulls employees, unscheduled jobs and the next
-   `SCHEDULED_WINDOW_DAYS` of scheduled jobs, then repeats every `SYNC_INTERVAL_SECONDS`.
+4. Set `HCP_MODE=live`, `HCP_API_KEY=...`, restart. The first sync pulls employees, unscheduled jobs, the next
+   `SCHEDULED_WINDOW_DAYS` of scheduled / in-progress jobs, and jobs marked complete over the last
+   `COMPLETED_LOOKBACK_DAYS`, then repeats every `SYNC_INTERVAL_SECONDS`. The probe's step 3b checks the completed-job
+   status names and what `arrival_window` holds on your account.
 5. **Set up technicians** under *Admin > Technicians*. New live technicians start with routing OFF until an admin sets
    their trade skills, home base, shift hours, work days and max jobs per day. Without that, they will never be
    suggested.
@@ -81,6 +83,7 @@ See [`.env.example`](.env.example) for the full annotated list. The important on
 | `HCP_API_KEY` | Housecall Pro API key. Server-side only. |
 | `GEOCODER`, `MAPS_API_KEY` | `mock`, `census`, `google` or `mapbox` |
 | `ROUTER`, `ROUTER_URL` | Road routes on the map: `none`, `osrm` (any OSRM server; default is the public demo server) or `mapbox` (uses `MAPS_API_KEY`). Unset = `osrm` in demo mode, `none` with live data. |
+| `COMPLETED_LOOKBACK_DAYS` | How many days back each sync looks for jobs HCP has marked complete (default 3). |
 | `DATABASE_PATH` | SQLite file (default `data/routing.db`) |
 | `SESSION_SECRET` | Signs login cookies. If empty, a random one is generated each start and everyone is logged out on restart. |
 | `SESSION_HTTPS_ONLY` | `true` when served over HTTPS (required for `APP_ENV=production`) |
@@ -96,8 +99,8 @@ See [`.env.example`](.env.example) for the full annotated list. The important on
   keywords + age. Every score shows its breakdown in the job card.
 - **Deadlines are targets, not hard limits.** Normal warranty calls have a 48 h window; AHS Emergency has no deadline
   clock (it is ranked by its base score alone). When a customer is not available, or there is any other reason to book
-  later, a dispatcher opens the job card, chooses *Scheduling this outside the window?*, picks a reason and optionally
-  adds a note. That job then shows *outside window* instead of overdue, earns no deadline points and is no longer
+  later, a dispatcher opens the job card, chooses *Booking this past its deadline?*, picks a reason and optionally
+  adds a note. That job then shows *deadline waived* instead of overdue, earns no deadline points and is no longer
   penalized by the slot finder. It is saved in this app only (never written to Housecall Pro), records who marked it,
   and survives syncs. *Remove* puts the job back on the normal deadline.
 - **Areas** (`Dispatch > Areas` tab, `GET /api/areas`): a running total of unscheduled calls per area (city by default,
@@ -106,12 +109,30 @@ See [`.env.example`](.env.example) for the full annotated list. The important on
   own against skills, shifts and existing routes, so openings are a guide, not a booking plan (calls share the same
   technicians). Click an area to filter the queue and map to it; the queue's *All areas* filter shows the same totals.
   Calls with no map location are counted but cannot be checked for openings.
-- **Slot finder** (`app/domain/slots.py`): for each eligible technician and day, tries the job in every gap of the route
-  (previous stop or home base -> new job -> next stop). Existing start times stay fixed. It checks skills, shift hours,
-  work days, max jobs and same-day lead time, and ranks by added drive time plus a per-day delay penalty (so Emergency
-  jobs prefer today) plus a penalty for finishing after the deadline (skipped for jobs marked outside the window). If a
-  job is already past its window, options are ranked by speed and cost and the card says so. The Areas tab runs the same
-  engine in a "soonest opening" mode.
+- **Arrival windows** (`app/domain/slots.py`): a customer is given a window ("between 8 AM and 12 PM"), not a time. The
+  standard is 4 hours (*Admin > Settings > Find best slot*); a dispatcher can pick a different length for one job next to
+  *Find best slot*. Windows start on the hour by default (change *Windows start every*), may overlap (job 1 8-12, job 2
+  10-2, or two jobs both 8-12), and never run past the end of the technician's shift. Existing jobs use HCP's
+  `arrival_window` (minutes after `scheduled_start`); a job with none gets the standard window. The scheduled end is read
+  as the job's length, not the window. Suggestions only: windows are not written to HCP.
+- **Slot finder** (`app/domain/slots.py`): for each eligible technician and day, tries the job at every position of the
+  route (home base or last finished job -> ... -> new job -> ...). A position is feasible if every open stop is still
+  reached inside its own window, driving and working straight through, and the day ends inside the shift. A stop that
+  is already late by our (estimated) travel times is tolerated at the arrival it already has: inserting a job may never
+  make it later. It also checks skills, work days, max jobs (finished jobs count) and same-day lead time, and ranks by
+  added drive time plus a per-day delay penalty (so Emergency jobs prefer today) plus a penalty for finishing after the
+  deadline (skipped for jobs whose deadline is waived). Each option shows the window to book, the planned arrival
+  ("arrive about 9:30"), and - if a nearby job (within *Offer the same window within*, 20 min of driving by default) has
+  a window holding that arrival - the same window start, with a note like "same window as Jane (12 min away)"; windows
+  that merely overlap are labelled as such. If a job is already past its deadline, options are ranked by speed and cost
+  and the card says so. The Areas tab runs the same engine in a "soonest opening" mode.
+- **Completed jobs** (`app/services/sync.py`): each sync also pulls jobs HCP has marked complete (last
+  `COMPLETED_LOOKBACK_DAYS`) and marks them `complete` here with their completion time. They stay on the map as dimmed
+  check-marks in their technician's route (the toolbar shows "N completed", each technician chip "N done"), earlier
+  days can be browsed from the date picker, and the slot finder treats them as finished: they count toward the daily
+  maximum and today's route continues from the last finished job. A job under way (`in progress`) keeps its technician
+  busy until it ends. If the completed-jobs call fails (the HCP status names are unverified) the rest of the sync still
+  runs and the run is noted as partial; finished jobs are never hidden because of it.
 - **Map**: a small built-in slippy map. Pin shape = source (square AHS, diamond other warranty, circle direct), color =
   priority, ring = deadline status. The tile source is `map.tile_url` in Settings (OpenStreetMap by default).
   Tile requests send the site's address (no path) as the `Referer`, which OpenStreetMap requires; without it OSM
@@ -127,7 +148,7 @@ See [`.env.example`](.env.example) for the full annotated list. The important on
   Areas tab still rank with straight-line estimates, so a slot card's "+4 min driving" can differ from the road time
   on the line.
 - **Sync** (`app/services/sync.py`): pulls from HCP, geocodes with a cache, deduplicates by description hash, and
-  deactivates jobs that HCP no longer returns.
+  deactivates open jobs that HCP no longer returns (completed jobs are history and stay).
 
 ## Security notes
 

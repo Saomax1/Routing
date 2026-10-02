@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 from app.domain.areas import area_of
 from app.domain.durations import DEFAULT_DURATIONS, estimate_minutes
 from app.domain.scoring import score_job
-from app.domain.slots import find_best_slots
+from app.domain.slots import choose_window, find_best_slots
 from app.domain.timeutil import at_local_minutes, ceil_to, parse_iso, to_iso
 from app.domain.travel import HaversineTravel, haversine_miles
 from app.services.settings_store import DEFAULT_SETTINGS, deep_merge, validate_settings
@@ -294,7 +294,7 @@ class SlotTests(unittest.TestCase):
         res = self.run_slots([tech(home=(0, 0))], {}, days=[self.THU, self.FRI], deadline=deadline)
         self.assertTrue(res["options"])
         self.assertFalse(any(o["misses_deadline"] for o in res["options"]))
-        self.assertTrue(any("past its scheduling window" in n for n in res["notes"]))
+        self.assertTrue(any("past its deadline" in n for n in res["notes"]))
         self.assertEqual(res["options"][0]["date"], self.THU.isoformat())   # still prefers the soonest slot
 
     def test_soonest_mode_ranks_by_start_time_not_drive_cost(self):
@@ -341,6 +341,195 @@ class SlotTests(unittest.TestCase):
         self.assertEqual(sched, before)
 
 
+class ChooseWindowTests(unittest.TestCase):
+    H = 60
+
+    def test_window_starts_on_the_hour_at_or_before_the_arrival(self):
+        self.assertEqual(choose_window(8 * 60 + 20, 480, 1020, 240, 60), (480, 720))            # arrive 8:20 -> 8-12
+        self.assertEqual(choose_window(10 * 60 + 20, 480, 1020, 240, 60), (600, 840))           # arrive 10:20 -> 10-2
+        self.assertEqual(choose_window(8 * 60 + 50, 480, 1020, 240, 30), (510, 750))            # 30-minute grid -> 8:30-12:30
+
+    def test_late_arrivals_keep_the_whole_window_inside_the_shift(self):
+        self.assertEqual(choose_window(15 * 60 + 10, 480, 1020, 240, 60), (780, 1020))          # 1-5 PM, not 3-7 PM
+        self.assertEqual(choose_window(8 * 60, 480, 540, 240, 60), (480, 540))                  # shift shorter than a window
+
+    def test_today_a_window_never_starts_in_the_past(self):
+        self.assertEqual(choose_window(14 * 60 + 40, 480, 1020, 240, 60, min_start=14 * 60), (840, 1020))   # 2-5 PM
+
+    def test_a_window_shorter_than_the_grid_step_still_contains_the_arrival(self):
+        ws, we = choose_window(8 * 60 + 50, 480, 1020, 30, 60)
+        self.assertTrue(ws <= 530 <= we)
+        self.assertEqual(we - ws, 30)
+
+    def test_the_arrival_is_always_inside_its_window(self):
+        for window in (15, 30, 60, 120, 240, 480, 720):
+            for grid in (5, 15, 30, 60, 120):
+                for min_start in (None, 600, 840):
+                    for eta in range(max(480, min_start or 0), 1000, 7):
+                        ws, we = choose_window(eta, 480, 1020, window, grid, min_start)
+                        ctx = (window, grid, min_start, eta, ws, we)
+                        self.assertTrue(ws <= eta <= we, ctx)
+                        self.assertTrue(480 <= ws and we <= 1020 and we - ws <= window, ctx)
+                        if min_start is not None:
+                            self.assertGreaterEqual(ws, min_start, ctx)
+
+
+def wstop(sid, x, y, start_h, start_m, dur, window=240, state=None):
+    """An existing stop with an arrival window starting at its scheduled time."""
+    s = stop(sid, x, y, start_h, start_m, dur)
+    s["win_start_min"], s["win_end_min"] = s["start_min"], s["start_min"] + window
+    if state:
+        s["state"] = state
+    return s
+
+
+class WindowSlotTests(unittest.TestCase):
+    THU = date(2026, 10, 1)
+    NOW = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)               # Thu 05:00 local: the tech is free from shift start
+
+    def find(self, techs, sched, job=(0, 10), now=None, duration=60, settings=None, **kw):
+        job = {"id": "NEW", "lat": job[0], "lng": job[1], "trade_code": "PLB"}
+        return find_best_slots(job, techs, sched, GridTravel(), settings or SETTINGS, now or self.NOW, [self.THU],
+                               duration, TZ, **kw)
+
+    def local(self, hh, mm):                                      # a "now" at hh:mm Phoenix time on the test Thursday
+        return datetime(2026, 10, 1, hh + 7, mm, tzinfo=UTC)
+
+    def tuned(self, **sched):
+        st = copy.deepcopy(SETTINGS)
+        st["scheduling"].update(sched)
+        return st
+
+    # ---- the window offered
+    def test_the_standard_window_is_four_hours(self):
+        o = self.find([tech(home=(0, 0))], {})["options"][0]
+        self.assertEqual((o["start_min"], o["window_start_min"], o["window_end_min"]), (490, 480, 720))   # arrive ~8:10 in 8-12
+        self.assertEqual(o["window_minutes"], 240)
+        self.assertEqual(o["start_iso"], "2026-10-01T15:10:00Z")
+        self.assertEqual((o["window_start_iso"], o["window_end_iso"]), ("2026-10-01T15:00:00Z", "2026-10-01T19:00:00Z"))
+
+    def test_the_window_length_can_be_changed_per_search_and_in_settings(self):
+        res = self.find([tech(home=(0, 0))], {}, window_min=120)
+        self.assertEqual((res["options"][0]["window_start_min"], res["options"][0]["window_end_min"]), (480, 600))
+        self.assertEqual(res["window_minutes"], 120)
+        res = self.find([tech(home=(0, 0))], {}, settings=self.tuned(window_minutes=180))
+        self.assertEqual(res["options"][0]["window_minutes"], 180)
+        res = self.find([tech(home=(0, 0))], {}, settings=self.tuned(window_minutes=180), window_min=300)
+        self.assertEqual(res["options"][0]["window_minutes"], 300)              # the per-search value wins
+
+    def test_a_late_arrival_gets_a_window_that_still_ends_with_the_shift(self):
+        o = self.find([tech(home=(0, 0))], {}, now=self.local(14, 40))["options"][0]    # free from ~15:10, today
+        self.assertEqual(o["start_min"], 15 * 60 + 20)
+        self.assertEqual((o["window_start_min"], o["window_end_min"]), (14 * 60, 17 * 60))   # not in the past, ends at 5 PM
+
+    # ---- overlapping windows and "same window" suggestions
+    def test_a_nearby_job_is_offered_the_same_window(self):
+        sched = {("t1", self.THU): [wstop("A", 0, 20, 8, 0, 60)]}                # A: 8-12, 10 min from the new job
+        o = self.find([tech(home=(0, 0))], sched, job=(0, 30))["options"][0]
+        self.assertEqual(o["after_stop_id"], "A")
+        self.assertEqual(o["start_min"], 9 * 60 + 30)                            # arrive after A: 8:20-9:20, +10 drive
+        self.assertEqual((o["window_start_min"], o["window_end_min"]), (480, 720))   # same 8-12 as A, not 9-1
+        self.assertEqual(o["stacked_with"], [{"id": "A", "label": "A", "drive_min": 10.0, "same_window": True,
+                                              "window_start_min": 480, "window_end_min": 720}])
+
+    def test_a_farther_job_gets_its_own_overlapping_window(self):
+        sched = {("t1", self.THU): [wstop("A", 0, 20, 8, 0, 60)]}                # A is 40 min away: not "close"
+        o = self.find([tech(home=(0, 0))], sched, job=(0, 60))["options"][0]
+        self.assertEqual(o["start_min"], 10 * 60)
+        self.assertEqual((o["window_start_min"], o["window_end_min"]), (600, 840))   # A 8-12, new 10-2: windows overlap
+        self.assertEqual(o["stacked_with"], [])
+
+    def test_a_nearby_job_with_a_partly_overlapping_window_is_reported_as_overlapping_not_the_same(self):
+        # A: 8:00, window until 9:45. The new job is 27 min away (stacking distance raised to 30) and is reached at
+        # 9:50, after A's window: it cannot share it, but its own 9-1 window overlaps A's.
+        sched = {("t1", self.THU): [wstop("A", 0, 20, 8, 0, 60, window=105)]}
+        o = self.find([tech(home=(0, 0))], sched, job=(0, 47), settings=self.tuned(stack_within_minutes=30))["options"][0]
+        self.assertEqual((o["start_min"], o["window_start_min"]), (590, 540))
+        (x,) = o["stacked_with"]
+        self.assertEqual((x["id"], x["same_window"], x["window_start_min"], x["window_end_min"]), ("A", False, 480, 585))
+
+    def test_the_stacking_distance_is_adjustable(self):
+        sched = {("t1", self.THU): [wstop("A", 0, 20, 8, 0, 60)]}
+        wide = self.find([tech(home=(0, 0))], sched, job=(0, 60), settings=self.tuned(stack_within_minutes=45))["options"][0]
+        self.assertEqual((wide["window_start_min"], wide["stacked_with"][0]["id"]), (480, "A"))
+        off = self.find([tech(home=(0, 0))], sched, job=(0, 30), settings=self.tuned(stack_within_minutes=0))["options"][0]
+        self.assertEqual((off["window_start_min"], off["stacked_with"]), (540, []))   # 10 min away but stacking is off
+
+    def test_a_stop_is_only_joined_if_its_window_holds_the_arrival_and_touching_is_not_overlap(self):
+        sched = {("t1", self.THU): [wstop("A", 0, 20, 8, 0, 60, window=60)]}     # A: 8-9 only, but we arrive 9:30
+        o = self.find([tech(home=(0, 0))], sched, job=(0, 30))["options"][0]
+        self.assertEqual((o["window_start_min"], o["stacked_with"]), (540, []))
+
+    # ---- windows give slack that fixed times did not
+    def test_big_windows_make_room_where_fixed_times_had_none(self):
+        # A at 9:00 (0,10), B at 10:30 (0,30), a 60-minute job at (0,20) needs 11:20 to reach B
+        fixed = {("t1", self.THU): [stop("A", 0, 10, 9, 0, 60), stop("B", 0, 30, 10, 30, 60)]}
+        wide = {("t1", self.THU): [wstop("A", 0, 10, 9, 0, 60), wstop("B", 0, 30, 10, 30, 60)]}
+        between = lambda res: any((o["after_stop_id"], o["before_stop_id"]) == ("A", "B") for o in res["options"])
+        self.assertFalse(between(self.find([tech()], fixed, job=(0, 20))))
+        res = self.find([tech()], wide, job=(0, 20))
+        self.assertTrue(between(res))
+        o = next(o for o in res["options"] if (o["after_stop_id"], o["before_stop_id"]) == ("A", "B"))
+        self.assertEqual([(p["id"], p["start_min"]) for p in o["route_preview"]],
+                         [("A", 540), ("NEW", 610), ("B", 680)])                # B is reached at 11:20, inside its window
+
+    def test_an_existing_window_is_never_broken(self):
+        for window, ok in ((60, True), (30, False)):                            # B opens 10:30; we reach it at 11:20
+            sched = {("t1", self.THU): [wstop("A", 0, 10, 9, 0, 60), wstop("B", 0, 30, 10, 30, 60, window=window)]}
+            res = self.find([tech()], sched, job=(0, 20))
+            got = any((o["after_stop_id"], o["before_stop_id"]) == ("A", "B") for o in res["options"])
+            self.assertEqual(got, window == 60 and ok, window)
+
+    def test_a_stop_that_is_already_late_is_not_made_later(self):
+        # A (0,100) is due at 8:30 but the tech is 100 min away: already late. After A is fine, before A is not.
+        sched = {("t1", self.THU): [wstop("A", 0, 100, 8, 30, 30, window=0)]}
+        res = self.find([tech(home=(0, 0))], sched, job=(0, 20))
+        self.assertEqual([(o["after_stop_id"], o["before_stop_id"]) for o in res["options"]], [("A", None)])
+
+    def test_a_stop_whose_window_closed_before_now_does_not_block_the_day(self):
+        sched = {("t1", self.THU): [wstop("L", 0, 10, 8, 0, 60, window=60)]}    # due 8-9, tech running late at 10:00
+        o = self.find([tech(home=(0, 0))], sched, job=(0, 20), now=self.local(10, 0))["options"][0]
+        self.assertEqual(o["after_stop_id"], "L")
+        self.assertEqual(o["start_min"], 11 * 60 + 50)                          # L reached 10:40, done 11:40, +10 drive
+
+    # ---- completed and in-progress work
+    def test_a_completed_job_is_the_starting_point_and_counts_toward_the_daily_max(self):
+        done = stop("C", 0, 50, 8, 0, 60)
+        done["state"] = "complete"
+        sched = {("t1", self.THU): [done]}
+        noon = self.local(12, 0)
+        o = self.find([tech(home=(0, 0))], sched, job=(0, 60), now=noon)["options"][0]
+        self.assertEqual((o["drive_in_min"], o["origin"]["kind"]), (10, "complete"))         # from C, not from home
+        self.assertEqual(o["start_min"], 12 * 60 + 40)
+        self.assertEqual((o["stops_in_day"], o["position"]), (1, 2))          # the second stop of the day: C came first
+        home_start = self.find([tech(home=(0, 0))], {}, job=(0, 60), now=noon)["options"][0]
+        self.assertEqual((home_start["drive_in_min"], home_start["origin"]["kind"]), (60, "home"))
+        full = self.find([tech(home=(0, 0), mx=1)], sched, job=(0, 60), now=noon)
+        self.assertEqual(full["options"], [])
+        self.assertIn("Fully booked", full["ineligible"][0]["reason"])
+
+    def test_a_job_in_progress_keeps_the_technician_busy_until_it_ends(self):
+        busy = stop("P", 0, 20, 11, 0, 120)                                     # 11:00-13:00
+        busy["state"] = "in_progress"
+        o = self.find([tech(home=(0, 0))], {("t1", self.THU): [busy]}, job=(0, 30), now=self.local(12, 0))["options"][0]
+        self.assertEqual(o["start_min"], 13 * 60 + 10)                          # free at 13:00 + 10 min drive
+        self.assertEqual(o["origin"]["kind"], "in_progress")
+
+    def test_completed_jobs_are_not_planned_again_or_shown_in_the_preview(self):
+        done = stop("C", 0, 5, 8, 0, 60)
+        done["state"] = "complete"
+        open_ = wstop("A", 0, 30, 13, 0, 60)
+        o = self.find([tech(home=(0, 0))], {("t1", self.THU): [done, open_]}, job=(0, 20), now=self.local(10, 0))["options"][0]
+        self.assertNotIn("C", [p["id"] for p in o["route_preview"]])
+        self.assertEqual(o["stops_in_day"], 2)
+
+    def test_the_schedule_passed_in_is_never_modified(self):
+        sched = {("t1", self.THU): [wstop("A", 0, 20, 8, 0, 60), wstop("B", 0, 40, 11, 0, 60)]}
+        before = copy.deepcopy(sched)
+        self.find([tech()], sched, job=(0, 30))
+        self.assertEqual(sched, before)
+
+
 class AreaTests(unittest.TestCase):
     def test_city_grouping_is_case_and_spacing_insensitive(self):
         a = area_of({"city": "  CHANDLER ", "zip": "85226"})
@@ -371,13 +560,19 @@ class MiscTests(unittest.TestCase):
         self.assertEqual(rules["AHS"]["Normal"], 48)
         self.assertEqual(rules["OTHER_WARRANTY"]["Normal"], 48)
         self.assertEqual(DEFAULT_SETTINGS["areas"]["group_by"], "city")
+        sched = DEFAULT_SETTINGS["scheduling"]
+        self.assertEqual((sched["window_minutes"], sched["window_step_minutes"], sched["stack_within_minutes"]), (240, 60, 20))
 
     def test_settings_validation(self):
         validate_settings({"scoring": {"base_direct_lead": 40}})
         validate_settings({"areas": {"group_by": "zip"}})
+        validate_settings({"scheduling": {"window_minutes": 180, "window_step_minutes": 30, "stack_within_minutes": 0}})
         for bad in ({"scoring": {"base_direct_lead": "x"}}, {"nope": 1}, {"timezone": "Mars/Base"},
                     {"deadline_rules": {"AHS": {"Normal": -1}}}, {"map": {"tile_url": "http://insecure/{z}/{x}/{y}"}},
-                    {"deadline_rules": {"AHS": 5}}, {"areas": {"group_by": "county"}}, {"areas": {"nope": 1}}):
+                    {"deadline_rules": {"AHS": 5}}, {"areas": {"group_by": "county"}}, {"areas": {"nope": 1}},
+                    {"scheduling": {"window_minutes": 5}}, {"scheduling": {"window_minutes": 721}},
+                    {"scheduling": {"window_step_minutes": 0}}, {"scheduling": {"stack_within_minutes": -1}},
+                    {"scheduling": {"stack_within_minutes": 500}}):
             with self.assertRaises(ValueError, msg=str(bad)):
                 validate_settings(bad)
 

@@ -126,6 +126,37 @@ def run_probe(client, limit=20, show_failures=False, tz=ZoneInfo("America/Phoeni
         with_emp = sum(1 for j in scheduled if (j.get("assigned_employees") or j.get("assigned_employee_ids")))
         printer(f"{with_emp}/{len(scheduled)} scheduled jobs have an assigned employee")
 
+    step("3b. Completed jobs and arrival windows (last 3 days)")
+    try:
+        completed = client.list_completed(today - timedelta(days=3), today, tz)
+    except HttpError as e:
+        printer("FAILED:", explain_http_error(e))
+        printer("-> the app asks for work_status 'complete rated' and 'complete unrated' (STATUS_COMPLETED in app/hcp/client.py). "
+                "If HCP names them differently, fix that list. Until it works, finished jobs just stay as they were.")
+        completed = []
+        report["completed_error"] = str(e)
+    report["completed_count"] = len(completed)
+    if completed:
+        done_statuses = Counter(str(j.get("work_status") or j.get("status")) for j in completed)
+        printer(f"OK - {len(completed)} completed jobs returned; work_status values:", dict(done_statuses),
+                "  <- all should be 'complete ...'; if not, the status filter is being ignored")
+        stamped = sum(1 for j in completed if normalize_job(j)["completed_at"])
+        printer(f"{stamped}/{len(completed)} have a completion time (work_timestamps.completed_at); the rest fall back to "
+                "the job's last update. If none do, find the field and add it to normalize_job() in app/hcp/normalize.py.")
+        report["completed_with_timestamp"] = stamped
+    elif "completed_error" not in report:
+        printer("No completed jobs in the last 3 days (nothing to check yet).")
+    windows = Counter(normalize_job(j)["arrival_window_minutes"] for j in scheduled + completed)
+    report["arrival_window_values"] = {str(k): v for k, v in windows.items()}
+    if windows:
+        printer("arrival window (minutes) seen on scheduled/completed jobs:", dict(windows))
+        printer("-> the app reads this as 'the technician may arrive any time from the scheduled start until start + this many "
+                "minutes'. Jobs with no value get the standard window (Admin > Settings, 4 hours). If the values look like the "
+                "job's LENGTH rather than a promise to the customer, say so: it changes how windows are read.")
+    if scheduled:
+        open_statuses = Counter(str(j.get("work_status") or j.get("status")) for j in scheduled)
+        printer("work_status values among scheduled jobs:", dict(open_statuses), "  (scheduled and in progress are expected)")
+
     step("4. Where does the warranty text live?")
     where = Counter()
     for j in unscheduled + scheduled:

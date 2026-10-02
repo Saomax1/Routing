@@ -3,13 +3,17 @@ import copy
 import json
 import os
 import shutil
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timezone, date
+from unittest import mock
 
 from app.config import Config
 from app.db import Database
 from app.domain.warranty_parser import WarrantyJob, parse_warranty_job
+from zoneinfo import ZoneInfo
+
 from app.hcp.client import HCPClient, MockHCPClient
 from app.hcp.fixtures import DEMO_TECH_SETUP, build_ahs_description
 from app.hcp.http import HttpError
@@ -25,11 +29,11 @@ NOW = datetime(2026, 10, 1, 15, 0, tzinfo=timezone.utc)   # Thu 08:00 America/Ph
 
 
 class Env:
-    def __init__(self):
+    def __init__(self, now=NOW):
         self.tmp = tempfile.mkdtemp()
         self.cfg = Config(database_path=os.path.join(self.tmp, "t.db"))
         self.db = Database(self.cfg.database_path)
-        self.hcp = MockHCPClient(now=NOW)
+        self.hcp = MockHCPClient(now=now)
         self.geo = MockGeocoder()
         self.svc = SyncService(self.db, self.cfg, self.hcp, self.geo,
                                new_tech_defaults=lambda eid: DEMO_TECH_SETUP.get(eid))
@@ -233,7 +237,7 @@ class DispatchViewTests(unittest.TestCase):
 
 
 class ExceptionTests(unittest.TestCase):
-    """Dispatcher marks a job as "scheduled outside the window" (the 48 h target is not a hard limit)."""
+    """Dispatcher waives a job's deadline (the 48 h target is not a hard limit)."""
 
     def setUp(self):
         self.e = Env()
@@ -280,7 +284,7 @@ class ExceptionTests(unittest.TestCase):
             slots = compute_slots(c, job["id"], s, NOW, 7)
         self.assertEqual(d["score"]["deadline_status"], "excused")
         self.assertEqual(d["score"]["exception"]["note"], "owner on vacation")
-        self.assertTrue(any("outside the window" in n for n in slots["notes"]))
+        self.assertTrue(any("Deadline waived" in n for n in slots["notes"]))
         self.assertFalse(any(o["misses_deadline"] for o in slots["options"]))
 
     def test_validation(self):
@@ -424,6 +428,209 @@ class AreaTotalsTests(unittest.TestCase):
             e.close()
 
 
+class CompletedJobsTests(unittest.TestCase):
+    """Jobs HCP has marked complete are pulled in and marked complete here (they used to just vanish)."""
+
+    def setUp(self):
+        self.e = Env()
+        self.e.svc.run(NOW)
+
+    def tearDown(self):
+        self.e.close()
+
+    def complete(self):
+        return self.e.q("SELECT * FROM jobs WHERE work_status = 'complete'")
+
+    def test_the_previous_workdays_jobs_are_pulled_and_marked_complete(self):
+        done = self.complete()
+        self.assertEqual(len(done), 8)                              # two for each of the four active technicians
+        for r in done:
+            self.assertEqual(r["active"], 1)
+            self.assertTrue(r["completed_at"].endswith("Z"), r["completed_at"])
+            self.assertEqual(r["scheduled_start"][:10], "2026-09-30")
+        self.assertEqual(self.e.q("SELECT COUNT(*) n FROM jobs WHERE work_status = 'complete' AND assigned_employee_ids = '[]'")[0]["n"], 0)
+
+    def test_open_jobs_have_no_completion_time(self):
+        self.assertEqual(self.e.q("SELECT COUNT(*) n FROM jobs WHERE work_status != 'complete' AND completed_at IS NOT NULL")[0]["n"], 0)
+
+    def test_a_job_hcp_completes_flips_from_scheduled_and_stays_on_the_map(self):
+        row = self.e.q("SELECT hcp_job_id FROM jobs WHERE work_status = 'scheduled' ORDER BY scheduled_start LIMIT 1")[0]
+        raw = next(j for j in self.e.hcp.dataset["jobs"] if j["id"] == row["hcp_job_id"])
+        raw["work_status"] = "complete rated"
+        raw["work_timestamps"] = {"completed_at": "2026-10-01T17:05:00Z"}
+        res = self.e.svc.run(NOW)
+        after = self.e.q("SELECT * FROM jobs WHERE hcp_job_id = ?", row["hcp_job_id"])[0]
+        self.assertEqual((after["work_status"], after["active"], after["completed_at"]),
+                         ("complete", 1, "2026-10-01T17:05:00Z"))
+        self.assertGreaterEqual(res["jobs_changed"], 1)
+
+    def test_a_second_sync_changes_nothing(self):
+        self.assertEqual(self.e.svc.run(NOW)["jobs_changed"], 0)
+
+    def test_completed_jobs_that_hcp_stops_returning_stay_as_history(self):
+        self.e.hcp.dataset["jobs"] = [j for j in self.e.hcp.dataset["jobs"] if "complete" not in j["work_status"]]
+        self.e.svc.run(NOW)
+        self.assertEqual(len(self.complete()), 8)
+        self.assertTrue(all(r["active"] == 1 for r in self.complete()))
+
+    def test_a_failing_completed_call_does_not_cost_us_the_rest_of_the_sync(self):
+        self.e.hcp.dataset["jobs"].append(copy.deepcopy(next(j for j in self.e.hcp.dataset["jobs"] if j["work_status"] == "unscheduled")))
+        self.e.hcp.dataset["jobs"][-1]["id"] = "job_new_after_failure"
+        with mock.patch.object(self.e.hcp, "list_completed", side_effect=HttpError(400, "/jobs")):
+            res = self.e.svc.run(NOW)
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(len(self.e.q("SELECT 1 FROM jobs WHERE hcp_job_id = 'job_new_after_failure'")), 1)
+        self.assertEqual(len(self.complete()), 8)                   # what we already knew is untouched
+        last = self.e.q("SELECT * FROM sync_runs ORDER BY id DESC LIMIT 1")[0]
+        self.assertIn("completed jobs could not be fetched", last["error"])
+
+    def test_a_job_we_missed_while_the_completed_call_was_failing_is_picked_up_later(self):
+        row = self.e.q("SELECT hcp_job_id FROM jobs WHERE work_status = 'scheduled' ORDER BY scheduled_start LIMIT 1")[0]
+        raw = next(j for j in self.e.hcp.dataset["jobs"] if j["id"] == row["hcp_job_id"])
+        raw["work_status"] = "complete unrated"
+        with mock.patch.object(self.e.hcp, "list_completed", side_effect=HttpError(0, "/jobs", "URLError")):
+            self.e.svc.run(NOW)                                     # HCP no longer lists it as scheduled: hidden for now
+            self.assertEqual(self.e.q("SELECT active FROM jobs WHERE hcp_job_id = ?", row["hcp_job_id"])[0]["active"], 0)
+        self.e.svc.run(NOW)                                         # the call works again: it comes back, as complete
+        back = self.e.q("SELECT work_status, active FROM jobs WHERE hcp_job_id = ?", row["hcp_job_id"])[0]
+        self.assertEqual((back["work_status"], back["active"]), ("complete", 1))
+
+    def test_todays_completed_jobs_survive_a_sync_where_the_completed_call_fails(self):
+        # Today's jobs are inside the window where unreturned jobs are hidden, so this is the case that matters:
+        # HCP no longer lists a finished job as scheduled, and if the completed call fails it must not vanish.
+        late = datetime(2026, 10, 1, 20, 0, tzinfo=timezone.utc)                  # 13:00: the morning's jobs are done
+        e = Env(now=late)
+        try:
+            e.svc.run(late)
+            todays = e.q("SELECT hcp_job_id FROM jobs WHERE work_status = 'complete' AND scheduled_start LIKE '2026-10-01%'")
+            self.assertGreater(len(todays), 0)
+            with mock.patch.object(e.hcp, "list_completed", side_effect=HttpError(0, "/jobs", "URLError")):
+                e.svc.run(late)
+            still = e.q("SELECT hcp_job_id, work_status, active FROM jobs WHERE work_status = 'complete' "
+                        "AND scheduled_start LIKE '2026-10-01%'")
+            self.assertEqual(len(still), len(todays))
+            self.assertTrue(all(r["active"] == 1 for r in still))
+        finally:
+            e.close()
+
+    def test_a_missing_completion_time_falls_back_to_the_last_update(self):
+        for j in self.e.hcp.dataset["jobs"]:
+            j.pop("work_timestamps", None)
+        self.e.svc.run(NOW)
+        self.assertTrue(all(r["completed_at"] for r in self.complete()))
+
+
+class MigrationTests(unittest.TestCase):
+    def test_a_database_from_before_completion_tracking_gets_the_new_column(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            path = os.path.join(tmp, "old.db")
+            Database(path)
+            raw = sqlite3.connect(path)
+            raw.execute("INSERT INTO jobs(hcp_job_id, work_status) VALUES ('keep-me', 'scheduled')")
+            raw.execute("ALTER TABLE jobs DROP COLUMN completed_at")             # what an older release created
+            raw.commit()
+            self.assertNotIn("completed_at", [r[1] for r in raw.execute("PRAGMA table_info(jobs)")])
+            raw.close()
+            db = Database(path)                                                   # starting the app again migrates it
+            with db.session() as c:
+                self.assertIn("completed_at", [r["name"] for r in c.execute("PRAGMA table_info(jobs)")])
+                self.assertEqual(c.execute("SELECT work_status, completed_at FROM jobs WHERE hcp_job_id = 'keep-me'").fetchone()[:], ("scheduled", None))
+            Database(path)                                                        # and doing it twice is harmless
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class CompletedJobsViewTests(unittest.TestCase):
+    """At 1 PM on the demo Thursday the morning's jobs are done, as they would be in HCP."""
+    LATE = datetime(2026, 10, 1, 20, 0, tzinfo=timezone.utc)        # 13:00 America/Phoenix
+
+    @classmethod
+    def setUpClass(cls):
+        cls.e = Env(now=cls.LATE)
+        cls.e.svc.run(cls.LATE)
+        with cls.e.db.session() as c:
+            cls.settings = get_settings(c)
+            cls.view = build_dispatch(c, date(2026, 10, 1), cls.settings, cls.LATE)
+            cls.yesterday = build_dispatch(c, date(2026, 9, 30), cls.settings, cls.LATE)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.e.close()
+
+    def stops(self, view):
+        return [s for t in view["technicians"] for s in t["stops"]]
+
+    def test_finished_and_in_progress_stops_are_marked(self):
+        statuses = {s["status"] for s in self.stops(self.view)}
+        self.assertIn("complete", statuses)
+        self.assertIn("scheduled", statuses)
+        done = [s for s in self.stops(self.view) if s["status"] == "complete"]
+        self.assertTrue(all(s["completed_iso"] for s in done))
+
+    def test_counts_split_open_and_done(self):
+        total = sum(t["job_count"] for t in self.view["technicians"])
+        done = sum(t["done_count"] for t in self.view["technicians"])
+        self.assertGreater(done, 0)
+        self.assertEqual(self.view["stats"]["completed_today"], done)
+        self.assertEqual(self.view["stats"]["scheduled_today"], total - done)
+        for t in self.view["technicians"]:
+            self.assertEqual(t["done_count"], sum(1 for s in t["stops"] if s["status"] == "complete"))
+
+    def test_the_previous_day_shows_its_finished_route(self):
+        stops = self.stops(self.yesterday)
+        self.assertEqual(len(stops), 8)
+        self.assertTrue(all(s["status"] == "complete" for s in stops))
+        self.assertEqual(self.yesterday["stats"]["completed_today"], 8)
+        self.assertEqual(self.yesterday["stats"]["scheduled_today"], 0)
+
+    def test_stops_carry_their_arrival_window(self):
+        for s in self.stops(self.view):
+            self.assertEqual(s["window_start_min"], s["start_min"])
+            self.assertEqual(s["window_end_min"] - s["window_start_min"], 60)       # the demo jobs promise a 60-minute window
+            self.assertEqual(s["window_minutes"], 60)
+
+    def test_a_job_with_no_hcp_window_gets_the_standard_four_hours(self):
+        with self.e.db.session() as c:
+            c.execute("UPDATE jobs SET arrival_window_minutes = NULL")
+            v = build_dispatch(c, date(2026, 10, 1), self.settings, self.LATE)
+            c.rollback()
+        self.assertTrue(all(s["window_minutes"] == 240 for s in self.stops(v)))
+
+    def test_slots_start_from_the_last_completed_job_and_count_it(self):
+        with self.e.db.session() as c:
+            top = self.view["unscheduled"][0]["id"]
+            res = compute_slots(c, top, self.settings, self.LATE, 1)
+        kinds = {o["tech_id"]: o["origin"]["kind"] for o in res["options"]}
+        self.assertIn("complete", set(kinds.values()))                              # someone has already worked today
+        with_done = next(o for o in res["options"] if o["origin"]["kind"] == "complete")
+        done_count = next(t["done_count"] for t in self.view["technicians"] if t["id"] == with_done["tech_id"])
+        self.assertGreaterEqual(with_done["stops_in_day"], done_count)
+
+    def test_a_window_can_be_chosen_per_search(self):
+        with self.e.db.session() as c:
+            top = self.view["unscheduled"][0]["id"]
+            default = compute_slots(c, top, self.settings, self.LATE, 3)
+            short = compute_slots(c, top, self.settings, self.LATE, 3, 120)
+            self.assertEqual(default["window_minutes"], 240)
+            self.assertEqual(short["window_minutes"], 120)
+            self.assertTrue(all(o["window_minutes"] <= 120 for o in short["options"]))
+            self.assertTrue(any(o["window_minutes"] == 240 for o in default["options"]))
+            for bad in (0, 10, 721, 5000):
+                with self.assertRaises(ValueError, msg=str(bad)):
+                    compute_slots(c, top, self.settings, self.LATE, 3, bad)
+
+    def test_every_window_holds_its_arrival_and_stays_in_the_shift(self):
+        with self.e.db.session() as c:
+            for u in self.view["unscheduled"][:6]:
+                if u["lat"] is None:
+                    continue
+                for o in compute_slots(c, u["id"], self.settings, self.LATE, 5)["options"]:
+                    self.assertTrue(o["window_start_min"] <= o["start_min"] <= o["window_end_min"], o)
+                    self.assertLessEqual(o["window_end_min"], 17 * 60)
+                    self.assertGreaterEqual(o["window_start_min"], 8 * 60)
+
+
 class SettingsTests(unittest.TestCase):
     def test_settings_roundtrip_and_durations(self):
         e = Env()
@@ -521,6 +728,23 @@ class HCPClientTests(unittest.TestCase):
         t = FakeTransport([[{"id": "a"}]])           # bare list instead of {"jobs": [...]}
         self.assertEqual(len(HCPClient(self.cfg(), transport=t).list_unscheduled()), 1)
 
+    def test_scheduled_calls_include_work_in_progress_and_completed_calls_have_their_own_request(self):
+        t = FakeTransport([{"jobs": []}])
+        c = HCPClient(self.cfg(), transport=t)
+        tz = ZoneInfo("America/Phoenix")
+        c.list_scheduled(date(2026, 10, 1), date(2026, 10, 15), tz)
+        scheduled = t.calls[-1]["params"]
+        self.assertIn(("work_status[]", "scheduled"), scheduled)
+        self.assertIn(("work_status[]", "in progress"), scheduled)
+        self.assertNotIn(("work_status[]", "complete rated"), scheduled)
+        c.list_completed(date(2026, 9, 28), date(2026, 10, 1), tz)
+        done = t.calls[-1]["params"]
+        self.assertIn(("work_status[]", "complete rated"), done)
+        self.assertIn(("work_status[]", "complete unrated"), done)
+        self.assertNotIn(("work_status[]", "scheduled"), done)
+        self.assertIn(("scheduled_start_min", "2026-09-28T07:00:00Z"), done)           # midnight Phoenix = 07:00 UTC
+        self.assertIn(("scheduled_start_max", "2026-10-02T07:00:00Z"), done)           # the end of that last day
+
     def test_key_never_in_repr_and_writes_disabled(self):
         c = HCPClient(self.cfg(), transport=FakeTransport([]))
         self.assertNotIn("sekret", repr(c))
@@ -547,6 +771,17 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(n["tags"], ["warranty", "x"])
         self.assertEqual((n["lead_source"], n["job_type"], n["zip"]), ("Yelp", "Plumbing", "85225"))
 
+    def test_completion_time_and_arrival_window(self):
+        done = normalize_job({"id": "d", "work_status": "complete rated",
+                              "work_timestamps": {"completed_at": "2026-10-01T17:05:00Z"},
+                              "schedule": {"scheduled_start": "2026-10-01T15:00:00Z", "arrival_window": 240}})
+        self.assertEqual((done["work_status"], done["completed_at"], done["arrival_window_minutes"]),
+                         ("complete", "2026-10-01T17:05:00Z", 240))
+        self.assertEqual(normalize_job({"id": "e", "completed_at": "2026-10-01T10:00:00-07:00"})["completed_at"], "2026-10-01T17:00:00Z")
+        open_job = normalize_job({"id": "o", "work_status": "scheduled"})
+        self.assertIsNone(open_job["completed_at"])
+        self.assertIsNone(open_job["arrival_window_minutes"])
+
     def test_garbage_does_not_crash(self):
         for raw in ({}, {"id": "x", "address": "123 Main", "customer": None, "schedule": "soon", "tags": None}):
             self.assertIsInstance(normalize_job(raw), dict)
@@ -559,6 +794,31 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(classify_source("Choice Home Warranty", [], None), "other_warranty")
         self.assertEqual(classify_source("Google LSA", ["lead"], None), "direct")
         self.assertEqual(normalize_employee({"id": "e", "first_name": "A", "last_name": "B"})["name"], "A B")
+
+
+class MockHcpTests(unittest.TestCase):
+    def test_the_demo_day_follows_the_clock(self):
+        early = MockHCPClient(now=NOW)                                                   # 08:00: nothing has happened yet
+        late = MockHCPClient(now=datetime(2026, 10, 1, 20, 0, tzinfo=timezone.utc))      # 13:00
+        today = (date(2026, 10, 1), date(2026, 10, 1))
+        tz = ZoneInfo("America/Phoenix")
+        self.assertEqual({j["work_status"] for j in early.list_scheduled(*today, tz)}, {"scheduled"})
+        self.assertEqual(early.list_completed(*today, tz), [])
+        self.assertTrue(any(j["work_status"] == "complete rated" for j in late.dataset["jobs"]))
+        statuses = {canonical_work_status(j["work_status"]) for j in late.list_scheduled(*today, tz)}
+        self.assertTrue(statuses <= {"scheduled", "in_progress"}, statuses)
+        self.assertTrue(late.list_completed(*today, tz))
+        for j in late.list_completed(*today, tz):
+            self.assertEqual(canonical_work_status(j["work_status"]), "complete")
+            self.assertIn("completed_at", j["work_timestamps"])
+
+    def test_yesterdays_completed_jobs_are_always_there_and_never_listed_as_scheduled(self):
+        c = MockHCPClient(now=NOW)
+        tz = ZoneInfo("America/Phoenix")
+        wed = date(2026, 9, 30)
+        self.assertEqual(len(c.list_completed(wed, wed, tz)), 8)
+        self.assertEqual(c.list_scheduled(wed, wed, tz), [])
+        self.assertEqual(len({j["id"] for j in c.dataset["jobs"]}), len(c.dataset["jobs"]))     # ids stay unique
 
 
 class AIFallbackTests(unittest.TestCase):

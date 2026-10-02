@@ -2,7 +2,7 @@
 Admin-editable settings (stored as one JSON document in the ``settings`` table), with defaults.
 
 ``deadline_rules`` control the deadline warnings and the urgency points in the priority score. They are
-TARGETS, not hard limits: a dispatcher can schedule a job outside its window and record why (see
+TARGETS, not hard limits: a dispatcher can waive a job's deadline and record why (see
 ``services/job_exceptions.py``). A priority with no rule (AHS Emergency) simply has no deadline clock.
 Normal warranty calls are 48 h; the Expedited and Direct values are still placeholders - confirm them
 under Admin > Settings.
@@ -32,7 +32,7 @@ DEFAULT_SETTINGS: dict = {
         "deadline_points": {"overdue": 40, "critical": 30, "warning": 15},
     },
     # Hours from "received" until the job should be scheduled/contacted. A target, not a hard limit (jobs can be
-    # marked "scheduled outside the window"). AHS Emergency has no rule on purpose. Expedited/Direct: confirm!
+    # given a "deadline waived" note). AHS Emergency has no rule on purpose. Expedited/Direct: confirm!
     "deadline_rules": {
         "AHS": {"Expedited": 24, "Normal": 48},
         "OTHER_WARRANTY": {"Normal": 48},
@@ -60,6 +60,10 @@ DEFAULT_SETTINGS: dict = {
         "travel_circuity": 1.3,     # straight-line distance x this ~= road distance
         "min_travel_minutes": 3,
         "same_day_lead_minutes": 30,  # don't suggest a start sooner than this from now
+        # Arrival windows: the customer is told "we'll arrive between X and X + window". Windows may overlap.
+        "window_minutes": 240,        # standard window (4 h); can also be changed per search on the job card
+        "window_step_minutes": 60,    # windows start on this grid (60 = on the hour: 8-12, 9-1, 10-2 ...)
+        "stack_within_minutes": 20,   # a nearby job (<= this much driving) is suggested into the same window
     },
     "map": {
         "tile_url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
@@ -127,6 +131,10 @@ def validate_settings(patch: dict) -> None:
     group_by = (patch.get("areas") or {}).get("group_by")
     if group_by is not None and group_by not in GROUP_BY:
         raise ValueError(f"Area grouping must be one of: {', '.join(GROUP_BY)}")
+    sched = patch.get("scheduling") or {}
+    for key, lo, hi in (("window_minutes", 15, 720), ("window_step_minutes", 5, 240), ("stack_within_minutes", 0, 120)):
+        if key in sched and not lo <= sched[key] <= hi:
+            raise ValueError(f"scheduling.{key} must be between {lo} and {hi}")
     tile = (patch.get("map") or {}).get("tile_url")
     if tile and not str(tile).startswith("https://"):
         raise ValueError("Map tile URL must start with https://")
