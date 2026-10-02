@@ -14,6 +14,7 @@ Conventions
 from __future__ import annotations
 
 import logging
+import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -28,6 +29,7 @@ from starlette.routing import Route
 
 from .db import jdump, jload, utcnow_iso
 from .domain.timeutil import hhmm_to_minutes, parse_date
+from .domain.travel import HaversineTravel
 from .security import MIN_PASSWORD_LENGTH, ROLES, burn_verify, hash_password, verify_password
 from .services.dispatch_view import build_areas, build_dispatch, build_job_detail, compute_slots, load_technicians
 from .services.geocode import geocode_cached
@@ -169,7 +171,7 @@ def app_config(ctx: Ctx, _):
     return {"mode": ctx.cfg.hcp_mode, "geocoder": ctx.cfg.geocoder, "timezone": s["timezone"],
             "today": now_utc().astimezone(tz).date().isoformat(), "map": s["map"],
             "sync_interval_seconds": ctx.cfg.sync_interval_seconds, "llm_enabled": ctx.cfg.llm_enabled,
-            "exception_reasons": reason_options()}
+            "exception_reasons": reason_options(), "routing": {"provider": ctx.app.state.routes.name}}
 
 
 # ------------------------------------------------------------------------ dispatch
@@ -217,6 +219,35 @@ def _days_param(raw) -> Optional[int]:
     if not 1 <= days <= 14:
         raise ApiError(400, "days must be an integer from 1 to 14")
     return days
+
+
+MAX_ROUTE_LEGS = 80
+
+
+def _point(raw, what: str):
+    ok = (isinstance(raw, (list, tuple)) and len(raw) == 2
+          and all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in raw)
+          and -90 <= raw[0] <= 90 and -180 <= raw[1] <= 180)
+    if not ok:
+        raise ApiError(400, f"{what} must be [latitude, longitude]")
+    return float(raw[0]), float(raw[1])
+
+
+@endpoint(body=True)
+def routes(ctx: Ctx, body):
+    """Road route (path + drive time) for each leg, or the straight-line estimate when road routing is off/down."""
+    legs = body.get("legs")
+    if not isinstance(legs, list) or not 1 <= len(legs) <= MAX_ROUTE_LEGS:
+        raise ApiError(400, f"legs must be a list of 1 to {MAX_ROUTE_LEGS} items")
+    parsed = []
+    for leg in legs:
+        if not isinstance(leg, dict):
+            raise ApiError(400, "each leg must be an object with a and b")
+        parsed.append((_point(leg.get("a"), "a"), _point(leg.get("b"), "b")))
+    with ctx.db.session() as conn:
+        travel = HaversineTravel.from_settings(get_settings(conn))
+        out = ctx.app.state.routes.routes(conn, parsed, travel)
+    return {"provider": ctx.app.state.routes.name, "routes": out}
 
 
 @endpoint()
@@ -457,6 +488,7 @@ ROUTES = [
     Route("/api/jobs/{job_id}/exception", exception_put, methods=["PUT"]),
     Route("/api/jobs/{job_id}/exception", exception_delete, methods=["DELETE"]),
     Route("/api/areas", areas),
+    Route("/api/routes", routes, methods=["POST"]),
     Route("/api/technicians", technicians_list),
     Route("/api/technicians/{tech_id}", technician_update, methods=["PUT"]),
     Route("/api/settings", settings_get, methods=["GET"]),

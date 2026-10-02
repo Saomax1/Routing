@@ -14,11 +14,11 @@ ADMIN = ("boss@example.com", "correct-horse-battery")
 DISPATCH = ("dispatch@example.com", "another-long-password")
 
 
-def make_app(**cfg_kw):
+def make_app(routes=None, **cfg_kw):
     tmp = tempfile.mkdtemp()
     cfg = Config(database_path=os.path.join(tmp, "api.db"), bootstrap_admin_email=ADMIN[0],
                  bootstrap_admin_password=ADMIN[1], session_secret="test-secret", sync_on_startup=False, **cfg_kw)
-    app = create_app(cfg, background_sync=False)
+    app = create_app(cfg, background_sync=False, routes=routes)
     bootstrap_users(app.state.db, cfg)
     return app, tmp
 

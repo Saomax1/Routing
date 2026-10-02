@@ -115,6 +115,13 @@ CREATE TABLE IF NOT EXISTS geocode_cache (
   provider TEXT NOT NULL, created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS route_cache (            -- road routes between two points (see services/routing.py)
+  key TEXT PRIMARY KEY,                             -- provider|lat,lng|lat,lng (5 decimals, about 1 m)
+  seconds REAL NOT NULL, meters REAL NOT NULL,
+  polyline TEXT NOT NULL,                           -- Google encoded polyline, precision 5
+  created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS sync_runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   started_at TEXT NOT NULL, finished_at TEXT,

@@ -56,6 +56,12 @@ class Config:
     geocoder: str = "mock"
     maps_api_key: str = ""
 
+    # Road routes drawn between jobs (display + drive time on hover): none | osrm | mapbox.
+    # osrm = any OSRM server (default: the public demo server, fair-use only); mapbox uses MAPS_API_KEY.
+    # NOTE: stop coordinates (customer locations) are sent to the provider, so with live data it is opt-in.
+    router: str = "none"
+    router_url: str = "https://router.project-osrm.org"
+
     # Optional LLM fallback for warranty text the regex parser cannot read. OFF unless key+model set.
     llm_api_key: str = ""
     llm_model: str = ""
@@ -104,6 +110,8 @@ def load_config() -> Config:
         hcp_page_size=_env_int("HCP_PAGE_SIZE", 100),
         geocoder=_env("GEOCODER", "mock").lower(),
         maps_api_key=_env("MAPS_API_KEY"),
+        router=_env("ROUTER", "osrm" if _env("HCP_MODE", "mock").lower() == "mock" else "none").lower(),
+        router_url=_env("ROUTER_URL", "https://router.project-osrm.org").rstrip("/"),
         llm_api_key=_env("LLM_API_KEY"),
         llm_model=_env("LLM_MODEL"),
         llm_api_url=_env("LLM_API_URL", "https://api.anthropic.com/v1/messages"),
@@ -139,6 +147,15 @@ def validate_config(cfg: Config) -> list:
         problems.append(f"GEOCODER must be mock|census|google|mapbox (got {cfg.geocoder!r})")
     if cfg.geocoder in ("google", "mapbox") and not cfg.maps_api_key:
         problems.append(f"GEOCODER={cfg.geocoder} needs MAPS_API_KEY")
+    if cfg.router not in ("none", "osrm", "mapbox"):
+        problems.append(f"ROUTER must be none|osrm|mapbox (got {cfg.router!r})")
+    if cfg.router == "mapbox" and not cfg.maps_api_key:
+        problems.append("ROUTER=mapbox needs MAPS_API_KEY")
+    if cfg.router == "osrm" and not cfg.router_url.startswith(("http://", "https://")):
+        problems.append("ROUTER_URL must start with http:// or https://")
+    if cfg.router == "osrm" and cfg.hcp_mode == "live" and "router.project-osrm.org" in cfg.router_url:
+        problems.append("ROUTER=osrm points at the public OSRM demo server: it is fair-use only and customer "
+                        "locations are sent to a third party. For daily use host your own OSRM or use mapbox.")
     if cfg.hcp_mode == "live" and cfg.geocoder == "mock":
         problems.append("Live HCP data with GEOCODER=mock will place pins at city centers only; "
                         "use census, google or mapbox")

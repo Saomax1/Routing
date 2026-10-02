@@ -38,8 +38,9 @@ touches real data).
 python -m unittest discover -s tests -t .
 ```
 
-146 tests cover the warranty parser, scoring, travel and slot engines, deadline exceptions, area totals, the sync
-pipeline and the API (auth, roles, CSRF, rate limiting). All fixtures are sanitized fake data. The suite uses only the standard library `unittest`.
+183 tests cover the warranty parser, scoring, travel and slot engines, deadline exceptions, area totals, road routing,
+the sync pipeline and the API (auth, roles, CSRF, rate limiting). All fixtures are sanitized fake data. The suite uses
+only the standard library `unittest`.
 
 ## Connecting to your real Housecall Pro account
 
@@ -60,6 +61,8 @@ auth header, `/jobs` and `/employees` paths, query parameter names, and where th
    `app/hcp/normalize.py` (field names). Everything HCP-specific is isolated in those two files and `app/hcp/http.py`.
 3. **Pick a real geocoder.** `GEOCODER=census` is free (US addresses). `google` or `mapbox` need `MAPS_API_KEY`. With
    `mock`, pins only land on city centers.
+   **Pick a road router** too (`ROUTER`, see below): with live data it is off until you choose, because it sends each
+   stop's coordinates to the routing provider.
 4. Set `HCP_MODE=live`, `HCP_API_KEY=...`, restart. The first sync pulls employees, unscheduled jobs and the next
    `SCHEDULED_WINDOW_DAYS` of scheduled jobs, then repeats every `SYNC_INTERVAL_SECONDS`.
 5. **Set up technicians** under *Admin > Technicians*. New live technicians start with routing OFF until an admin sets
@@ -77,6 +80,7 @@ See [`.env.example`](.env.example) for the full annotated list. The important on
 | `HCP_MODE` | `mock` (demo data, default) or `live` |
 | `HCP_API_KEY` | Housecall Pro API key. Server-side only. |
 | `GEOCODER`, `MAPS_API_KEY` | `mock`, `census`, `google` or `mapbox` |
+| `ROUTER`, `ROUTER_URL` | Road routes on the map: `none`, `osrm` (any OSRM server; default is the public demo server) or `mapbox` (uses `MAPS_API_KEY`). Unset = `osrm` in demo mode, `none` with live data. |
 | `DATABASE_PATH` | SQLite file (default `data/routing.db`) |
 | `SESSION_SECRET` | Signs login cookies. If empty, a random one is generated each start and everyone is logged out on restart. |
 | `SESSION_HTTPS_ONLY` | `true` when served over HTTPS (required for `APP_ENV=production`) |
@@ -113,12 +117,23 @@ See [`.env.example`](.env.example) for the full annotated list. The important on
   Tile requests send the site's address (no path) as the `Referer`, which OpenStreetMap requires; without it OSM
   answers "403 Access blocked". OSM's free servers are for light use only, so for daily team use pick a commercial
   tile provider (Stadia, MapTiler, Mapbox...) and paste its URL into `map.tile_url`.
+- **Road routes** (`app/services/routing.py`, `POST /api/routes`): the line between a technician's stops follows the
+  roads, and hovering any leg shows its drive time and distance (also on the dashed preview when you hover or pin a
+  slot; a technician's chip shows the day's total by road). The page asks its own server, which asks the routing
+  provider (`ROUTER`), so keys never reach the browser. Lines start straight and snap to the roads a moment later.
+  Every leg is cached in the database for 30 days, so it is fetched once. If the provider is off, rejecting us or
+  unreachable, the leg stays straight and the tooltip says it is a straight-line estimate; after a failure the provider
+  is skipped for a minute so a dead server cannot slow the page down. This is display only: the slot finder and the
+  Areas tab still rank with straight-line estimates, so a slot card's "+4 min driving" can differ from the road time
+  on the line.
 - **Sync** (`app/services/sync.py`): pulls from HCP, geocodes with a cache, deduplicates by description hash, and
   deactivates jobs that HCP no longer returns.
 
 ## Security notes
 
 - HCP, maps and LLM keys stay on the server. They are redacted from config logging and never reach the browser or git.
+- Road routing sends stop coordinates (customer locations) to the routing provider (`ROUTER`), and only to it. Errors are
+  logged by type only, never with coordinates. With live data it stays off until you set `ROUTER`.
 - Login with `admin` and `dispatcher` roles; passwords hashed with scrypt (minimum 10 characters); failed logins are
   rate-limited; the session ID rotates on login.
 - Mutating `/api` calls require the `X-Requested-With: routing-app` header (CSRF defense); strict CSP and security
@@ -135,8 +150,11 @@ See [`.env.example`](.env.example) for the full annotated list. The important on
   Expedited (24 h) and direct jobs (24 h) are guesses: confirm them under *Admin > Settings*. With no clock, an AHS
   Emergency no longer picks up deadline points, so an overdue Expedited job can tie with a fresh Emergency in the
   queue. Raise *Base: Emergency* under *Priority score* if you want Emergency to stay on top.
-- **Travel times are straight-line (Haversine) estimates**, not road routing. The `TravelTimeProvider` interface in
-  `app/domain/travel.py` is where a routing API goes.
+- **The slot finder and Areas tab still use straight-line (Haversine) travel estimates.** Map lines and their hover
+  times use real roads, but ranking does not yet. Using road times there needs a distance-matrix call (OSRM `table`,
+  Mapbox Matrix) behind the `TravelTimeProvider` interface in `app/domain/travel.py`.
+- **The public OSRM demo server is fair-use only.** It is fine to try and for light use; for daily use host your own OSRM
+  (or use `ROUTER=mapbox`).
 - **Stack deviation:** the original plan assumed FastAPI + React + Leaflet. The build sandbox could not install packages
   from PyPI or npm, so this uses Starlette + stdlib `sqlite3` + plain ES modules + a built-in map. Everything is
   standard and can be moved to a bigger stack later; the pure engines in `app/domain/` do not depend on the web layer.

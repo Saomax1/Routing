@@ -30,6 +30,7 @@ export const api = {
   slots: (id, days) => req('POST', `/api/jobs/${encodeURIComponent(id)}/slots`, days ? { days } : {}),
   setException: (id, body) => req('PUT', `/api/jobs/${encodeURIComponent(id)}/exception`, body),
   clearException: (id) => req('DELETE', `/api/jobs/${encodeURIComponent(id)}/exception`),
+  routes: (legs) => req('POST', '/api/routes', { legs }),
   areas: (days) => req('GET', '/api/areas' + (days ? `?days=${encodeURIComponent(days)}` : '')),
   technicians: () => req('GET', '/api/technicians'),
   updateTech: (id, body) => req('PUT', `/api/technicians/${encodeURIComponent(id)}`, body),

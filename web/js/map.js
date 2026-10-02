@@ -143,13 +143,26 @@ export class SlippyMap {
       });
       l._el = pl; this.svg.append(pl);
     }
+    // Lines with a `tip` get a wide invisible twin to hover (a 3px line is hard to hit). The twins go last so they sit
+    // above every visible line; hovering one thickens its line and shows the tooltip.
+    for (const l of lines) {
+      if (!l.tip) continue;
+      const hit = svgEl('polyline', { class: 'sm-hit', fill: 'none', stroke: 'transparent', 'stroke-width': 16, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' });
+      const width = l.width || 3;
+      hit.addEventListener('mouseenter', (e) => { l._el.setAttribute('stroke-width', width + 2); l._el.setAttribute('stroke-opacity', 1); this.showTip(l.tip, e); });
+      hit.addEventListener('mousemove', (e) => this.showTip(l.tip, e));
+      hit.addEventListener('mouseleave', () => { l._el.setAttribute('stroke-width', width); l._el.setAttribute('stroke-opacity', l.opacity ?? 0.85); this.hideTip(); });
+      l._hit = hit; this.svg.append(hit);
+    }
     this._placeLines(this.topLeft());
   }
   _placeLines(tl) {
     for (const l of this.lines.values()) {
       if (!l._el) continue;
-      l._el.setAttribute('points', l.points.filter((p) => p[0] != null && p[1] != null)
-        .map(([la, ln]) => { const p = this.toPx(la, ln, tl); return `${p.x.toFixed(1)},${p.y.toFixed(1)}`; }).join(' '));
+      const pts = l.points.filter((p) => p[0] != null && p[1] != null)
+        .map(([la, ln]) => { const p = this.toPx(la, ln, tl); return `${p.x.toFixed(1)},${p.y.toFixed(1)}`; }).join(' ');
+      l._el.setAttribute('points', pts);
+      if (l._hit) l._hit.setAttribute('points', pts);
     }
   }
   tip(el, lines) {

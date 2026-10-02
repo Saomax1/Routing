@@ -1,7 +1,7 @@
 // Dispatch screen: map (routes + unscheduled pins), prioritized queue, job card, "find best slot".
 // Read-only against Housecall Pro in this phase: slot suggestions are shown, dispatchers schedule in HCP.
 
-import { h, render, icon, svgEl, fmtTime, fmtMinutes, fmtDay, fmtDateTime, fmtDuration, fmtAge, fmtLeft, fmtPhone,
+import { h, render, icon, svgEl, fmtTime, fmtMinutes, fmtDay, fmtDateTime, fmtDuration, fmtDrive, fmtAge, fmtLeft, fmtPhone,
   money, timeAgo, SOURCE_LABEL, toast } from '../dom.js';
 import { api } from '../api.js';
 import { SlippyMap } from '../map.js';
@@ -89,7 +89,7 @@ export function mountDispatch(root, ctx) {
         title: t.needs_setup ? 'Needs trade skills and a home base: Admin > Technicians' : `${t.name}: click to show/hide`,
         onclick: () => { state.hidden.has(t.id) ? state.hidden.delete(t.id) : state.hidden.add(t.id); renderToolbar(); renderMap(false); },
       }, h('span', { class: 'dot' }), h('span', { class: 'tc-name' }, t.name),
-      h('span', { class: 'tc-meta' }, `${t.job_count} job${t.job_count === 1 ? '' : 's'}${t.drive_min ? ` · ${t.drive_min} min drive` : ''}`),
+      h('span', { class: 'tc-meta', title: driveTotal(t) != null ? 'Total drive time by road' : 'Straight-line estimate' }, `${t.job_count} job${t.job_count === 1 ? '' : 's'}${(driveTotal(t) ?? t.drive_min) ? ` · ${Math.round(driveTotal(t) ?? t.drive_min)} min drive` : ''}`),
       t.needs_setup ? icon('alert', 13) : null)));
     const sync = h('div', { class: 'dp-sync' },
       h('span', { class: 'dim' }, d.last_sync ? `Synced ${timeAgo(d.last_sync.finished_at || d.last_sync.started_at)}${d.last_sync.status === 'error' ? ' (failed)' : ''}` : 'Never synced'),
@@ -424,16 +424,65 @@ export function mountDispatch(root, ctx) {
     return el;
   }
 
+  // ---------------------------------------------------------------- road routes
+  // Lines start out straight and snap to the roads when /api/routes answers (the page never waits on the routing
+  // service). Each leg is asked for once; the server caches roads for weeks and falls back to an estimate if the
+  // routing service is off or down, in which case the leg is asked again after a minute.
+  const roadsOn = !!(config.routing && config.routing.provider !== 'none');
+  const routeCache = new Map(), routeAsked = new Set(), routeWanted = new Map();
+  let routeTimer = null, destroyed = false;
+  const rkey = (a, b) => `${a[0].toFixed(5)},${a[1].toFixed(5)}>${b[0].toFixed(5)},${b[1].toFixed(5)}`;
+  function routeFor(a, b) {
+    const k = rkey(a, b), r = routeCache.get(k);
+    const stale = !r || (Date.now() - r.at > 60000 && (r.source === 'none' || (r.source === 'estimate' && roadsOn)));
+    if (stale && !routeAsked.has(k)) routeWanted.set(k, [a, b]);
+    return r || null;
+  }
+  function fetchRoutes() {
+    const legs = [...routeWanted.values()]; routeWanted.clear();
+    for (let i = 0; i < legs.length; i += 60) {
+      const chunk = legs.slice(i, i + 60);
+      chunk.forEach(([a, b]) => routeAsked.add(rkey(a, b)));
+      api.routes(chunk.map(([a, b]) => ({ a, b })))
+        .then((res) => chunk.forEach(([a, b], j) => routeCache.set(rkey(a, b), { ...res.routes[j], at: Date.now() })))
+        .catch(() => chunk.forEach(([a, b]) => routeCache.set(rkey(a, b), { minutes: null, miles: null, path: null, source: 'none', at: Date.now() })))
+        .finally(() => { chunk.forEach(([a, b]) => routeAsked.delete(rkey(a, b))); scheduleRouteRedraw(); });
+    }
+  }
+  function scheduleRouteRedraw() {
+    clearTimeout(routeTimer);
+    routeTimer = setTimeout(() => { if (destroyed || !state.data) return; renderToolbar(); renderMap(false); }, 40);
+  }
+  // a technician's day as legs between consecutive located points: home -> stop 1 -> stop 2 ...
+  function techLegs(t) {
+    const nodes = (t.home ? [{ p: [t.home.lat, t.home.lng], label: 'Home' }] : [])
+      .concat(t.stops.filter((s) => s.lat != null).map((s) => ({ p: [s.lat, s.lng], label: `Stop ${s.seq}` })));
+    return nodes.slice(1).map((n, i) => ({ a: nodes[i].p, b: n.p, from: nodes[i].label, to: n.label }));
+  }
+  // total drive time by road, only when every leg of the day is known by road (never a mix of road and estimate)
+  function driveTotal(t) {
+    const legs = techLegs(t), rs = legs.map(({ a, b }) => routeCache.get(rkey(a, b)));
+    return legs.length && rs.every((r) => r && r.source === 'road') ? rs.reduce((sum, r) => sum + r.minutes, 0) : null;
+  }
+  function legTip(r, who) {
+    if (!r) return ['Finding the road route…', who];
+    if (r.minutes == null) return ['Drive time unavailable', who];
+    return [`${fmtDrive(r.minutes)} drive${r.miles ? ` · ${r.miles} mi` : ''}`, who,
+      r.source === 'road' ? 'By road' : `Straight-line estimate (road routing is ${roadsOn ? 'unavailable right now' : 'off'})`];
+  }
+
   function renderMap(fit) {
     const d = state.data; if (!d) return;
     map.clearMarkers();
     const lines = [], pts = [];
     for (const t of d.technicians) {
       if (state.hidden.has(t.id)) continue;
-      const path = [];
-      if (t.home) { path.push([t.home.lat, t.home.lng]); const hm = h('div', { class: 'home', style: { '--c': t.color }, title: `${t.name}: home base` }, icon('home', 14)); map.addMarker(`home:${t.id}`, t.home.lat, t.home.lng, hm, 2); pts.push([t.home.lat, t.home.lng]); }
-      for (const s of t.stops) if (s.lat != null) { path.push([s.lat, s.lng]); map.addMarker(`stop:${s.id}:${t.id}`, s.lat, s.lng, makeStop(s, t), 5); pts.push([s.lat, s.lng]); }
-      if (path.length > 1) lines.push({ id: `route:${t.id}`, points: path, color: t.color, width: 3, opacity: 0.75 });
+      if (t.home) { const hm = h('div', { class: 'home', style: { '--c': t.color }, title: `${t.name}: home base` }, icon('home', 14)); map.addMarker(`home:${t.id}`, t.home.lat, t.home.lng, hm, 2); pts.push([t.home.lat, t.home.lng]); }
+      for (const s of t.stops) if (s.lat != null) { map.addMarker(`stop:${s.id}:${t.id}`, s.lat, s.lng, makeStop(s, t), 5); pts.push([s.lat, s.lng]); }
+      techLegs(t).forEach(({ a, b, from, to }, i) => {
+        const r = routeFor(a, b);
+        lines.push({ id: `route:${t.id}:${i}`, points: r && r.path ? r.path : [a, b], color: t.color, width: 3, opacity: 0.75, tip: legTip(r, `${t.name}: ${from} → ${to}`) });
+      });
     }
     for (const s of d.unassigned_scheduled) if (s.lat != null) { map.addMarker(`stop:${s.id}`, s.lat, s.lng, makeStop(s, null), 4); pts.push([s.lat, s.lng]); }
 
@@ -447,9 +496,14 @@ export function mountDispatch(root, ctx) {
     // slot preview (hover or pinned), drawn on top
     const opt = state.hoverOpt || state.pinnedOpt;
     if (opt && opt.date === d.date) {
-      const path = (opt.home ? [[opt.home.lat, opt.home.lng]] : []).concat(opt.route_preview.filter((p) => p.lat != null).map((p) => [p.lat, p.lng]));
-      lines.push({ id: 'preview-halo', points: path, color: '#ffffff', width: 8, opacity: 0.9 },
-        { id: 'preview', points: path, color: opt.tech_color || '#111827', width: 4, dash: '8 7', opacity: 1 });
+      const nodes = (opt.home ? [{ p: [opt.home.lat, opt.home.lng], label: 'Home' }] : [])
+        .concat(opt.route_preview.filter((p) => p.lat != null).map((p, i) => ({ p: [p.lat, p.lng], label: p.is_new ? 'New job' : `Stop ${i + 1}` })));
+      for (let i = 1; i < nodes.length; i++) {
+        const a = nodes[i - 1].p, b = nodes[i].p, r = routeFor(a, b), points = r && r.path ? r.path : [a, b];
+        lines.push({ id: `preview-halo:${i}`, points, color: '#ffffff', width: 8, opacity: 0.9 },
+          { id: `preview:${i}`, points, color: opt.tech_color || '#111827', width: 4, dash: '8 7', opacity: 1,
+            tip: legTip(r, `${opt.tech_name}: ${nodes[i - 1].label} → ${nodes[i].label}`) });
+      }
       const np = opt.route_preview.find((p) => p.is_new);
       if (np && np.lat != null) {
         const nm = h('div', { class: 'newpin', style: { '--c': opt.tech_color || '#111827' } }, h('span', {}, 'NEW'));
@@ -458,6 +512,7 @@ export function mountDispatch(root, ctx) {
       }
     }
     map.setLines(lines);
+    fetchRoutes();
     const fitOpts = { padding: 60, maxZoom: 13, top: 120 };   // 120px: the toolbar + technician chips overlay
     if (fit) map.fit(pts, fitOpts);
     else map._lastFit = { points: pts, ...fitOpts };
@@ -466,7 +521,7 @@ export function mountDispatch(root, ctx) {
   // --------------------------------------------------------------- lifecycle
   timer = setInterval(() => { if (!document.hidden) load({ quiet: true }); }, 60000);
   load();
-  return { destroy() { clearInterval(timer); map.destroy(); } };
+  return { destroy() { destroyed = true; clearInterval(timer); clearTimeout(routeTimer); map.destroy(); } };
 }
 
 function buildLegend() {
@@ -481,6 +536,6 @@ function buildLegend() {
     h('div', { class: 'lg-row' }, h('b', {}, 'Shape'), shape('ahs', 'AHS'), shape('other', 'Other warranty'), shape('direct', 'Direct lead')),
     h('div', { class: 'lg-row' }, h('b', {}, 'Color'), dot('prio-emergency', 'Emergency'), dot('prio-expedited', 'Expedited'), dot('prio-normal', 'Normal'), dot('prio-direct', 'Direct')),
     h('div', { class: 'lg-row' }, h('b', {}, 'Ring'), dot('ring-warning', 'window closing'), dot('ring-critical', 'critical'), dot('ring-overdue', 'overdue'), h('span', { class: 'dim' }, '(none = outside window or no deadline)')),
-    h('div', { class: 'lg-row dim' }, 'Numbers = queue rank · water drop = urgency keyword · colored circles = scheduled stops by technician'));
+    h('div', { class: 'lg-row dim' }, 'Numbers = queue rank · water drop = urgency keyword · colored circles = scheduled stops by technician · hover a route line for its drive time'));
   return el;
 }

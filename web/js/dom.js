@@ -108,6 +108,10 @@ export function fmtDuration(min) {
   const h = Math.floor(min / 60), m = min % 60;
   return m ? `${h} h ${m} min` : `${h} h`;
 }
+export function fmtDrive(min) {
+  if (min == null) return '';
+  return min < 1 ? '<1 min' : fmtDuration(min);
+}
 export function fmtAge(hours) {
   if (hours == null) return '';
   return hours < 1 ? `${Math.max(1, Math.round(hours * 60))} min` : hours < 48 ? `${Math.round(hours)} h` : `${(hours / 24).toFixed(1)} d`;

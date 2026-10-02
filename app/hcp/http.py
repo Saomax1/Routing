@@ -3,7 +3,8 @@ Tiny JSON-over-HTTPS transport (stdlib only) with retry + exponential backoff.
 
 * Retries 429 and 5xx (and network errors) honouring ``Retry-After``; gives up after ``max_attempts``.
 * Error messages contain only the HTTP status and the URL *path* - never headers, query strings
-  or bodies - so API keys and customer data cannot leak into logs.
+  or bodies - so API keys and customer data cannot leak into logs. When the path itself carries data
+  (a Mapbox geocoding address, routing coordinates) pass ``label`` and that is logged instead.
 """
 
 from __future__ import annotations
@@ -32,12 +33,12 @@ class UrllibTransport:
         self.timeout, self.max_attempts, self.base_delay, self._sleep = timeout, max_attempts, base_delay, sleep
 
     def request(self, method: str, url: str, headers: Optional[dict] = None, params: Optional[list] = None,
-                json_body: Any = None) -> Any:
+                json_body: Any = None, label: Optional[str] = None) -> Any:
         """``params`` is a list of (key, value) tuples so repeated keys (work_status[]) work."""
         full = url
         if params:
             full += ("&" if "?" in url else "?") + urllib.parse.urlencode(params, doseq=True)
-        path = urllib.parse.urlparse(url).path
+        path = label or urllib.parse.urlparse(url).path
         data = json.dumps(json_body).encode() if json_body is not None else None
         hdrs = {"Accept": "application/json", **(headers or {})}
         if data is not None:

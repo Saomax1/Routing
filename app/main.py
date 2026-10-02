@@ -29,6 +29,7 @@ from .hcp.client import make_hcp_client
 from .hcp.fixtures import DEMO_TECH_SETUP
 from .security import LoginLimiter, hash_password
 from .services.geocode import make_geocoder
+from .services.routing import make_road_routes
 from .services.settings_store import get_settings, seed_durations
 from .services.sync import SyncService
 
@@ -105,7 +106,8 @@ async def sync_loop(app: Starlette) -> None:
         log.error("sync loop crashed: %s", type(e).__name__)
 
 
-def create_app(cfg: Optional[Config] = None, hcp=None, geocoder=None, background_sync: bool = True) -> Starlette:
+def create_app(cfg: Optional[Config] = None, hcp=None, geocoder=None, background_sync: bool = True,
+               routes=None) -> Starlette:
     cfg = cfg or load_config()
     if cfg.session_secret_generated:
         log.warning("SESSION_SECRET is not set: using a random one, so everyone is logged out whenever the server "
@@ -152,6 +154,7 @@ def create_app(cfg: Optional[Config] = None, hcp=None, geocoder=None, background
     )
     app.state.cfg, app.state.db, app.state.hcp = cfg, db, hcp
     app.state.geocoder, app.state.sync = geocoder, sync
+    app.state.routes = routes or make_road_routes(cfg)
     app.state.login_limiter = LoginLimiter()
     return app
 

@@ -106,7 +106,8 @@ class MapboxGeocoder:
 
     def geocode(self, address: str) -> Optional[LatLng]:
         url = self.URL.format(q=urllib.parse.quote(address, safe=""))
-        data = self.t.request("GET", url, params=[("access_token", self.key), ("country", "us"), ("limit", 1)])
+        data = self.t.request("GET", url, params=[("access_token", self.key), ("country", "us"), ("limit", 1)],
+                              label="/geocoding/v5/mapbox.places")
         feats = (data or {}).get("features") or []
         if not feats:
             return None

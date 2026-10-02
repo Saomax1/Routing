@@ -209,3 +209,4 @@ dl { margin: 0; } .kv { display: grid; grid-template-columns: 110px minmax(0, 1f
 .exc summary { cursor: pointer; font-weight: 600; color: var(--dim); } .exc[open] summary { margin-bottom: 8px; }
 .exc-form { display: flex; flex-direction: column; gap: 8px; } .exc-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .q-filters > select { flex: 1 1 calc(50% - 6px); }            /* four filters: two per row instead of truncated labels */
+.sm-hit { pointer-events: stroke; }                         /* route lines: hover target (the svg itself ignores the mouse) */
