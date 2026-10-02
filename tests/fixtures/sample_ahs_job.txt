@@ -1,0 +1,82 @@
+<a href="http://dispa.me/AAAA1111" target="_blank">Ahs Authorization Link</a>
+<a href="http://dispa.me/BBBB2222" target="_blank">Open in web</a>
+ahs:90000001
+90000001 PLB Normal:NORMAL
+# Job Brand Information
+
+This is an AHS customer.
+
+# Customer Information
+
+ **JANE SAMPLE** (Dispatch Contact)
+
+**HOME:**[\(480\) 555-0101](tel:+14805550101)
+
+**JANE SAMPLE** (Contract Contact)
+
+**Cellular:**[\(480\) 555-0101](tel:+14805550101)
+
+# Autho Link
+
+Authorization Link: [Click Here] (https://contractor.frontdoorhome.com/redirect?dest=ER&amp;dispatch=90000001&amp;svcReq=21000001&amp;tenant=AHS&amp;vendorId=1000000&amp;tradeCode=PLB)
+
+# Vendor
+
+**Vendor ID**:1000000
+
+# Contract Information
+
+**Contract ID:**600000001
+
+**Contract Effective Date:** 2026-01-04
+
+**Contract Expiration Date:** 2027-01-04
+
+
+# Covered Property Address
+
+123 W EXAMPLE ST
+CHANDLER, AZ 85226
+
+# Work Order Information
+
+**Dispatch Priority:**Normal
+
+**Autho Required?:** False
+
+ ## **Items**
+
+## Item 1: Stoppage
+
+**Problem:**
+Not Working,
+
+
+**Status:** Open
+
+# Coverage Information
+
+## Coverage Notes
+
+
+
+SHIELDGOLD HOME WARRANTY
+
+30-DAY RECALL APPLIES TO THE SERVICE WORK PERFORMED ON THE PREVIOUS DISPATCH REQUEST
+
+REMINDER: COMPLETION DATE MUST BE PROVIDED TO AHS FOR ALL SERVICE CALLS
+
+*** DO NOT COLLECT TRADE SERVICE FEE ***
+
+*** Payment Type : PREPAY ***
+## Coverage Details
+
+- Rust and Corrosion
+# Payment
+
+**Total: $100
+
+**Paid: $0
+
+**Remaining: $100
+
