@@ -40,40 +40,66 @@ touches real data).
 python -m unittest discover -s tests -t .
 ```
 
-274 tests cover the warranty parser, scoring, travel and slot engines, arrival windows, completed jobs, deadline
-exceptions, area totals, slot confirmation, road routing, the sync pipeline and the API (auth, roles, CSRF, rate limiting). All fixtures are sanitized fake data. The suite uses
+314 tests cover the warranty parser, scoring, travel and slot engines, arrival windows, completed jobs, deadline
+exceptions, area totals, slot confirmation, road routing, the sync pipeline, the read-only live connection (checked over real HTTP against a stand-in Housecall Pro server), the go-live and live-check scripts, and the API (auth, roles, CSRF, rate limiting). All fixtures are sanitized fake data. The suite uses
 only the standard library `unittest`.
 
-## Connecting to your real Housecall Pro account
+## Connecting to your real Housecall Pro account (read-only)
 
-Do this in order. Step 1 matters: **the HCP request details in this code are unverified assumptions** (base URL, `Token`
-auth header, `/jobs` and `/employees` paths, query parameter names, and where the warranty text lives in a job).
+The app only ever **reads** Housecall Pro. Its connection to Housecall Pro is limited to `GET` requests in code
+(`ReadOnlyTransport` in `app/hcp/http.py`: any other method is refused before a request is built), and the tests prove it
+over real HTTP against a stand-in server that records everything it receives. What a *key* is allowed to do is decided by
+Housecall Pro, not by this app: if Housecall Pro lets you limit an API key to read access, use such a key. API access
+is reported to need the MAX plan, and an Admin user generates the key.
 
-1. **Run the Phase 0 probe first.** Put your key in `.env` (never in chat, email or git), then:
+**One command does the switch:**
 
-   ```bash
-   python scripts/phase0_probe.py --limit 30 --show-failures
-   ```
+```bash
+python scripts/go_live.py
+```
 
-   It is read-only. It checks that the key works, prints the *shape* of the data (field names and types, no customer
-   values), shows where the warranty text lives, and dry-runs the parser on real descriptions (shown with names and
-   phone numbers redacted). It writes `data/phase0_report.json`, which contains structure and counts only and is safe
-   to share. Use `--mock` to rehearse the script against the demo data.
-2. **Fix anything that did not match.** Adjust `app/hcp/client.py` (auth scheme, paths, parameters) and
-   `app/hcp/normalize.py` (field names). Everything HCP-specific is isolated in those two files and `app/hcp/http.py`.
-3. **Pick a real geocoder.** `GEOCODER=census` is free (US addresses). `google` or `mapbox` need `MAPS_API_KEY`. With
-   `mock`, pins only land on city centers.
-   **Pick a road router** too (`ROUTER`, see below): with live data it is off until you choose, because it sends each
-   stop's coordinates to the routing provider.
-4. Set `HCP_MODE=live`, `HCP_API_KEY=...`, restart. The first sync pulls employees, unscheduled jobs, the next
+It asks for your API key (typed hidden: not shown, never printed, never sent anywhere but Housecall Pro) and tests it with
+a single read of the employee list. Then it asks how addresses become map pins and whether to draw road routes (both
+send customer locations to the provider you pick, so it explains each choice; road routes default to off). It then
+**removes the fake demo customers, jobs and technicians** from the database, offers to replace the demo login
+(`admin@example.com`) with your own, and saves the settings to `.env` (never committed to git). If the key is rejected
+it changes nothing.
+
+Then:
+
+1. **Start the app:** `python -m app`. The first sync loads your real employees, unscheduled jobs, the next
    `SCHEDULED_WINDOW_DAYS` of scheduled / in-progress jobs, and jobs marked complete over the last
-   `COMPLETED_LOOKBACK_DAYS`, then repeats every `SYNC_INTERVAL_SECONDS`. The probe's step 3b checks the completed-job
-   status names and what `arrival_window` holds on your account.
-5. **Set up technicians** under *Admin > Technicians*. New live technicians start with routing OFF until an admin sets
-   their trade skills, home base, shift hours, work days and max jobs per day. Without that, they will never be
-   suggested.
-6. **Confirm the deadline rules** under *Admin > Settings*: Normal is 48 h and AHS Emergency has no clock; the
-   Expedited and Direct hours are still placeholders (see below).
+   `COMPLETED_LOOKBACK_DAYS`, then repeats every `SYNC_INTERVAL_SECONDS`. The badge top right changes from *DEMO DATA* to
+   *LIVE · read-only*.
+2. **Set up technicians** under *Admin > Technicians*. Real technicians start with routing OFF until an admin sets their
+   trade skills, home base, shift hours, work days and max jobs per day. Without that, they will never be suggested.
+3. **Test routing on your real data:** `python scripts/live_check.py`. It syncs, then checks that jobs loaded and their
+   addresses became pins, which technicians are ready, and puts the slot finder through its paces on your most urgent
+   real jobs: every suggested slot is checked against the rules it must keep (inside the window and the shift, a working
+   day, the right trade skill, under the daily maximum). With a road router configured it also compares real road
+   drive times with the straight-line estimate the slot finder uses and suggests a travel speed if they differ
+   (*Admin > Settings*), and it flags pins that are over 100 miles from every technician (a wrongly placed address). It prints
+   PASS / WARN / FAIL lines and writes `data/live_check_report.json`: counts, timings and ratios only, with no customer
+   names, addresses, phone numbers or job ids, so it is safe to share if something needs fixing.
+   `--no-sync` uses what the app already loaded; `--jobs 10` tests more jobs; `--mock` rehearses the script on the demo
+   data in a temporary database.
+4. **If something does not match** (the HCP request details in this code were written from documentation and have not yet
+   been seen against a live account): run `python scripts/phase0_probe.py --limit 30 --show-failures`. It is read-only and
+   prints the *shape* of your data (field names and types, no customer values), shows where the warranty text lives, and
+   dry-runs the parser on real descriptions with names and phone numbers redacted. Fix `app/hcp/client.py` (auth scheme,
+   paths, parameters) or `app/hcp/normalize.py` (field names); everything HCP-specific is isolated there and in
+   `app/hcp/http.py`.
+5. **Confirm the deadline rules** under *Admin > Settings*: Normal is 48 h and AHS Emergency has no clock; the Expedited and
+   Direct hours are still placeholders (see below).
+
+**Demo data and real data never mix.** Demo rows are recognised only by their ids (`job_demo_*`, `emp_demo_*`, which
+Housecall Pro never uses). In live mode the app deletes them at every start and sync (and the caches built from the fake
+addresses), and only ever those. In demo mode the app refuses to load demo data into a database that already holds real
+Housecall Pro data, so flipping `.env` back to mock by mistake cannot put fake jobs into your real schedule: use another
+`DATABASE_PATH` for demos. Logins, settings and technician set-up for real people are never touched.
+
+Prefer to do it by hand? Set `HCP_MODE=live`, `HCP_API_KEY=...`, `GEOCODER=census` (and optionally `ROUTER`) in `.env` and
+restart; the same cleanup applies.
 
 ## Environment variables
 
@@ -178,7 +204,10 @@ See [`.env.example`](.env.example) for the full annotated list. The important on
 - Full warranty descriptions and phone numbers are not written to logs. The front end renders HCP data with `textContent`
   only, since HCP text is untrusted.
 - Put it behind HTTPS before exposing it beyond your own machine, and set `SESSION_HTTPS_ONLY=true`.
-- The HCP client has no write methods; the ones that exist raise `NotImplementedError`. Confirming a slot saves the
+- The HCP client is read-only by construction: its transport refuses everything but `GET` (and a `GET` with a body), the
+  write methods that exist raise `NotImplementedError`, and a test fails if the client ever gains a public method that is
+  not a plain read. The API key is sent only to Housecall Pro, in the `Authorization` header (never in a URL), and
+  `scripts/go_live.py` reads it hidden and writes it only to `.env`. Confirming a slot saves the
   booking in this app's database only. Phase 2 write-back must only run on an explicit dispatcher action with a
   confirmation step: the confirm box and the server-side re-check are that step.
 
@@ -211,7 +240,7 @@ app/            backend (api.py, main.py, config.py, db.py, security.py)
 app/domain/     pure logic: parser, scoring, travel, slots, time helpers
 app/hcp/        HCP client (live + mock), normalizer, demo fixtures
 app/services/   sync, geocoding, AI fallback, dispatch views, settings, bookings, slot confirmation, road routes
-scripts/        phase0_probe.py, seed.py, create_user.py
+scripts/        go_live.py, live_check.py, phase0_probe.py, seed.py, create_user.py
 web/            no-build front end (index.html, css/, js/)
 tests/          unittest suite + sanitized fixtures
 ```

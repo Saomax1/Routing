@@ -35,6 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.config import load_config  # noqa: E402
 from app.domain.warranty_parser import looks_like_warranty, missing_key_fields, parse_warranty_job  # noqa: E402
 from app.hcp.client import HCPClient, MockHCPClient  # noqa: E402
+from app.hcp.diagnose import explain_http_error  # noqa: E402
 from app.hcp.http import HttpError  # noqa: E402
 from app.hcp.normalize import normalize_job  # noqa: E402
 from app.services.ai_fallback import redact  # noqa: E402
@@ -63,21 +64,6 @@ def text_fields(obj, prefix=""):
 
 def step(title):
     print(f"\n=== {title} " + "=" * max(0, 60 - len(title)))
-
-
-def explain_http_error(e: HttpError) -> str:
-    return {
-        0: "Network problem (could not reach the API). Check HCP_BASE_URL and your internet / proxy.",
-        401: "401 Unauthorized: the API key was rejected. Check HCP_API_KEY, and HCP_AUTH_SCHEME in app/config.py "
-             "(the default is 'Token'; try 'Bearer' if the docs say so).",
-        403: "403 Forbidden: the key works but this account/plan may not include API access (reported as the MAX plan), "
-             "or the key lacks permission for this endpoint.",
-        404: "404 Not Found: the endpoint path is probably different. Check JOBS_PATH / EMPLOYEES_PATH in app/hcp/client.py "
-             "against the docs.",
-        422: "422/400: a query parameter name is probably different. Check the PARAM_* constants in app/hcp/client.py.",
-        400: "400 Bad Request: a query parameter name or value is probably different. Check the PARAM_* constants.",
-        429: "429 Rate limited. Wait a minute and retry.",
-    }.get(e.status, f"HTTP {e.status}")
 
 
 def run_probe(client, limit=20, show_failures=False, tz=ZoneInfo("America/Phoenix"), out_path=None, printer=print):

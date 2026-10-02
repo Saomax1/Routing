@@ -34,6 +34,7 @@ from ..hcp.normalize import (canonical_trade, classify_source, guess_trade_from_
                              normalize_job)
 from .ai_fallback import ai_fill
 from .bookings import drop_stale
+from .data_mode import has_real_data, purge_demo_data
 from .geocode import geocode_cached
 from .settings_store import get_settings, seed_durations
 
@@ -71,6 +72,10 @@ class SyncService:
             settings = get_settings(conn)
             run_id = conn.execute("INSERT INTO sync_runs(started_at, status, mode) VALUES (?, 'running', ?)",
                                   (utcnow_iso(), self.cfg.hcp_mode)).lastrowid
+            refusal = self._keep_demo_and_real_apart(conn)
+        if refusal:
+            self._finish(run_id, "error", 0, 0, refusal)
+            return {"status": "error", "error": refusal}
         tz = ZoneInfo(settings["timezone"])
         today = now.astimezone(tz).date()
         end = today + timedelta(days=self.cfg.scheduled_window_days)
@@ -145,6 +150,20 @@ class SyncService:
         self._finish(run_id, status, len(seen), changed, "; ".join(note) or None)
         log.info("sync %s: %d jobs seen, %d changed, %d errors", status, len(seen), changed, errors)
         return {"status": status, "jobs_seen": len(seen), "jobs_changed": changed, "errors": errors}
+
+    def _keep_demo_and_real_apart(self, conn) -> Optional[str]:
+        """Live mode: demo rows are removed. Demo mode: refuse to add demo data to a database holding real data."""
+        if self.cfg.hcp_mode == "live":
+            gone = purge_demo_data(conn)
+            if any(gone.values()):
+                log.warning("sync: removed demo data (%d jobs, %d technicians) before loading Housecall Pro data",
+                            gone["jobs"], gone["technicians"])
+            return None
+        if has_real_data(conn):
+            return ("This database holds real Housecall Pro data, so the built-in demo data will not be loaded into it "
+                    "(it would put fake jobs next to real customers). Set HCP_MODE=live, or point DATABASE_PATH at a "
+                    "different file for demos.")
+        return None
 
     def _finish(self, run_id: int, status: str, seen: int, changed: int, error: Optional[str]) -> None:
         with self.db.session() as conn:

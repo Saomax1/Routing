@@ -28,6 +28,7 @@ from .db import Database, utcnow_iso
 from .hcp.client import make_hcp_client
 from .hcp.fixtures import DEMO_TECH_SETUP
 from .security import LoginLimiter, hash_password
+from .services.data_mode import has_real_data, purge_demo_data
 from .services.geocode import make_geocoder
 from .services.routing import make_road_routes
 from .services.settings_store import get_settings, seed_durations
@@ -116,6 +117,14 @@ def create_app(cfg: Optional[Config] = None, hcp=None, geocoder=None, background
     with db.session() as conn:
         seed_durations(conn)
         tz_name = get_settings(conn)["timezone"]
+        if cfg.hcp_mode == "live":              # never show demo data next to real customers (even if the key is wrong)
+            gone = purge_demo_data(conn)
+            if any(gone.values()):
+                log.warning("Removed demo data left from an earlier demo run (%d jobs, %d technicians).",
+                            gone["jobs"], gone["technicians"])
+        elif has_real_data(conn):
+            log.warning("HCP_MODE is not 'live' but this database holds real Housecall Pro data: demo data will NOT be "
+                        "loaded into it. Set HCP_MODE=live to use it.")
     hcp = hcp or make_hcp_client(cfg, tz_name)
     geocoder = geocoder or make_geocoder(cfg)
     sync = SyncService(db, cfg, hcp, geocoder,

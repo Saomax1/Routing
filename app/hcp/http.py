@@ -27,6 +27,26 @@ class HttpError(Exception):
         super().__init__(f"HTTP {status} for {path}" + (f": {message}" if message else ""))
 
 
+class ReadOnlyViolation(Exception):
+    """Something tried to send Housecall Pro anything but a read."""
+
+
+class ReadOnlyTransport:
+    """Wraps a transport so it can only READ. Anything other than a plain GET (any write method, or a request
+    body) is refused before a request is even built, so no code path in this app - present or future - can change
+    data in Housecall Pro through the client. Write-back (Phase 2) must be a separate, deliberate transport."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def request(self, method: str, url: str, headers: Optional[dict] = None, params: Optional[list] = None,
+                json_body: Any = None, **kw) -> Any:
+        if str(method).upper() != "GET" or json_body is not None:
+            raise ReadOnlyViolation(f"Housecall Pro is read-only here: refused {str(method).upper()} "
+                                    f"{urllib.parse.urlparse(url).path}")
+        return self.inner.request("GET", url, headers=headers, params=params, **kw)
+
+
 class UrllibTransport:
     def __init__(self, timeout: float = 30.0, max_attempts: int = 5, base_delay: float = 1.0,
                  sleep: Callable[[float], None] = time.sleep):

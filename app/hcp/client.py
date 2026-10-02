@@ -1,7 +1,8 @@
 """
 Housecall Pro clients.
 
-``HCPClient``      - live calls (read-only in this phase; write-back arrives in Phase 2)
+``HCPClient``      - live calls. READ-ONLY: its transport can only GET (see http.ReadOnlyTransport); write-back
+                   arrives in Phase 2
 ``MockHCPClient``  - serves sanitized demo data, no network (HCP_MODE=mock, the default)
 
 Both expose the same read methods, returning RAW HCP-shaped dicts which
@@ -28,7 +29,7 @@ from zoneinfo import ZoneInfo
 from ..config import Config
 from ..domain.timeutil import parse_iso, to_iso
 from .fixtures import make_demo_dataset
-from .http import UrllibTransport
+from .http import ReadOnlyTransport, UrllibTransport
 from .normalize import canonical_work_status
 
 log = logging.getLogger("routing.hcp")
@@ -68,7 +69,7 @@ class HCPClient:
         self.page_size = cfg.hcp_page_size
         self._key = cfg.hcp_api_key
         self._scheme = cfg.hcp_auth_scheme
-        self.transport = transport or UrllibTransport()
+        self.transport = ReadOnlyTransport(transport or UrllibTransport())    # GET only, enforced
         self.truncated = False   # set when MAX_PAGES was hit (so the admin page can warn)
 
     def __repr__(self) -> str:
