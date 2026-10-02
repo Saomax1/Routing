@@ -480,6 +480,17 @@ class WindowSlotTests(unittest.TestCase):
             got = any((o["after_stop_id"], o["before_stop_id"]) == ("A", "B") for o in res["options"])
             self.assertEqual(got, window == 60 and ok, window)
 
+    def test_stops_are_ordered_by_planned_arrival_not_by_window_start(self):
+        """B was booked into a wide 1-5 PM window but arrives at 3:10, after A (1:30-2:30). B opens earlier than A, yet
+        the route is still A then B: a job dropped between them goes between them."""
+        a = wstop("A", 0, 10, 13, 30, 60, window=60)
+        b = {"id": "B", "lat": 0, "lng": 30, "start_min": 910, "end_min": 970, "label": "B",
+             "win_start_min": 780, "win_end_min": 1020}
+        res = self.find([tech(home=(0, 0))], {("t1", self.THU): [b, a]}, job=(0, 20))
+        o = res["options"][0]
+        self.assertEqual((o["after_stop_id"], o["before_stop_id"], o["added_drive_min"]), ("A", "B", 0))
+        self.assertEqual([p["id"] for p in o["route_preview"]], ["A", "NEW", "B"])
+
     def test_a_stop_that_is_already_late_is_not_made_later(self):
         # A (0,100) is due at 8:30 but the tech is 100 min away: already late. After A is fine, before A is not.
         sched = {("t1", self.THU): [wstop("A", 0, 100, 8, 30, 30, window=0)]}

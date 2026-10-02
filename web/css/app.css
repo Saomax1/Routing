@@ -216,3 +216,15 @@ dl { margin: 0; } .kv { display: grid; grid-template-columns: 110px minmax(0, 1f
 .stat.done { color: var(--ok); }
 .slot-stack { margin-top: 3px; font-size: 12px; font-weight: 600; color: var(--ok); display: flex; gap: 4px; align-items: center; }
 .slots-ctl { flex-wrap: wrap; row-gap: 6px; }                          /* window + days + button must wrap inside the 410px panel */
+/* confirming a slot, and jobs booked here (saved in this app, not in Housecall Pro yet) */
+.confirm { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border: 2px solid var(--accent); border-left: 6px solid var(--c, var(--accent)); border-radius: var(--radius); background: var(--panel); }
+.confirm h4 { margin: 0; font-size: 14px; } .confirm dl { margin: 0; } .confirm .kv dd { font-weight: 600; } .confirm .hint { margin: 0; }
+.d-sec.booked { padding: 10px 12px; border: 1px solid var(--border); border-left: 6px solid var(--c, var(--accent)); border-radius: var(--radius); background: var(--panel-2); }
+.d-sec.booked h3 { display: flex; align-items: center; gap: 4px; color: var(--ok); } .bk-what { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 15px; }
+.bk-what .dot, .bk-top .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--c); flex: none; }
+.bk-hint { margin: 8px 14px 4px; }
+.bk-card { display: flex; flex-direction: column; gap: 4px; padding: 10px 14px 10px 12px; border-bottom: 1px solid var(--border); border-left: 4px solid var(--c, var(--accent)); cursor: pointer; }
+.bk-card:hover { background: var(--panel-2); } .bk-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; } .bk-when { margin-left: auto; font-weight: 600; color: var(--dim); }
+.bk-meta { font-size: 12px; } .bk-note { font-size: 13px; font-style: italic; } .bk-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+.stop.booked { background: #fff; color: var(--c); border: 2px dashed var(--c); cursor: pointer; }          /* hollow + dashed: booked here, not in HCP yet */
+.stop.booked.sel { outline: 3px solid var(--c); outline-offset: 2px; }                                    /* static: never animate a positioned marker */

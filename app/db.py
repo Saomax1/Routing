@@ -92,6 +92,18 @@ CREATE TABLE IF NOT EXISTS job_exceptions (         -- dispatcher says: "waive t
   set_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS bookings (               -- a dispatcher confirmed a slot here; Housecall Pro does not know yet
+  hcp_job_id TEXT PRIMARY KEY REFERENCES jobs(hcp_job_id) ON DELETE CASCADE,
+  tech_id TEXT NOT NULL,
+  arrive_at TEXT NOT NULL, end_at TEXT NOT NULL,    -- planned arrival and finish (UTC)
+  window_start_at TEXT NOT NULL, window_end_at TEXT NOT NULL,   -- the arrival window promised to the customer
+  duration_min INTEGER NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  booked_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  booked_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bookings_arrive ON bookings(arrive_at);
+
 CREATE TABLE IF NOT EXISTS job_durations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   trade_code TEXT NOT NULL DEFAULT '*',             -- '*' = any trade

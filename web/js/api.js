@@ -29,6 +29,8 @@ export const api = {
   job: (id) => req('GET', `/api/jobs/${encodeURIComponent(id)}`),
   slots: (id, days, windowMinutes) => req('POST', `/api/jobs/${encodeURIComponent(id)}/slots`,
     { ...(days ? { days } : {}), ...(windowMinutes ? { window_minutes: windowMinutes } : {}) }),
+  book: (id, body) => req('POST', `/api/jobs/${encodeURIComponent(id)}/booking`, body),
+  unbook: (id) => req('DELETE', `/api/jobs/${encodeURIComponent(id)}/booking`),
   setException: (id, body) => req('PUT', `/api/jobs/${encodeURIComponent(id)}/exception`, body),
   clearException: (id) => req('DELETE', `/api/jobs/${encodeURIComponent(id)}/exception`),
   routes: (legs) => req('POST', '/api/routes', { legs }),

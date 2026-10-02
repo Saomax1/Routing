@@ -1,5 +1,6 @@
-// Dispatch screen: map (routes + unscheduled pins), prioritized queue, job card, "find best slot".
-// Read-only against Housecall Pro in this phase: slot suggestions are shown, dispatchers schedule in HCP.
+// Dispatch screen: map (routes + unscheduled pins), prioritized queue, job card, "find best slot" and its confirmation.
+// Read-only against Housecall Pro in this phase: a confirmed slot is saved in this app and added to the technician's
+// route here (a "booking"); dispatchers still enter it in HCP, and it drops off the Booked list once HCP shows it.
 
 import { h, render, icon, svgEl, fmtTime, fmtMinutes, fmtDay, fmtDateTime, fmtDuration, fmtDrive, fmtAge, fmtLeft, fmtPhone,
   money, timeAgo, SOURCE_LABEL, toast } from '../dom.js';
@@ -17,6 +18,7 @@ export function mountDispatch(root, ctx) {
     hidden: new Set(), selectedId: null, detail: null, detailLoading: false,
     slots: null, slotsFor: null, slotsLoading: false, slotDays: 3, hoverOpt: null, pinnedOpt: null,
     slotWindow: (config.scheduling && config.scheduling.window_minutes) || 240,
+    booking: false, bookNote: '', bookError: null,
     firstFit: true, lastUpdated: null, error: null,
   };
 
@@ -83,7 +85,8 @@ export function mountDispatch(root, ctx) {
       d.stats.overdue ? h('span', { class: 'stat bad' }, h('b', {}, d.stats.overdue), ' overdue') : null,
       d.stats.unmapped ? h('span', { class: 'stat dim', title: 'Jobs without a map location (see the job card)' }, h('b', {}, d.stats.unmapped), ' unmapped') : null,
       h('span', { class: 'stat' }, h('b', {}, d.stats.scheduled_today), ' scheduled this day'),
-      d.stats.completed_today ? h('span', { class: 'stat done', title: 'Marked complete in Housecall Pro' }, h('b', {}, d.stats.completed_today), ' completed') : null);
+      d.stats.completed_today ? h('span', { class: 'stat done', title: 'Marked complete in Housecall Pro' }, h('b', {}, d.stats.completed_today), ' completed') : null,
+      d.bookings.length ? h('span', { class: 'stat', title: 'Confirmed in this app, not in Housecall Pro yet (Booked tab)' }, h('b', {}, d.bookings.length), ' booked here') : null);
     const chips = h('div', { class: 'dp-techs', role: 'group', 'aria-label': 'Technicians' },
       d.technicians.map((t) => h('button', {
         class: `tech-chip${state.hidden.has(t.id) ? ' off' : ''}${t.active ? '' : ' inactive'}`, type: 'button', 'aria-pressed': String(!state.hidden.has(t.id)),
@@ -115,6 +118,7 @@ export function mountDispatch(root, ctx) {
     const keep = queue.querySelector('.q-list'); const scroll = keep ? keep.scrollTop : 0;
     if (state.selectedId) { renderDetail(); return; }
     if (state.view === 'areas') { renderAreas(); return; }
+    if (state.view === 'booked') { renderBooked(); return; }
     const list = filtered();
     const trades = [...new Set(state.data.unscheduled.map((u) => u.trade_code).filter(Boolean))].sort();
     const sel = (key, label, opts) => h('select', { 'aria-label': label, onchange: (e) => { state.filters[key] = e.target.value; renderQueue(); renderMap(false); } },
@@ -149,7 +153,46 @@ export function mountDispatch(root, ctx) {
       onclick: () => { if (state.view === id) return; state.view = id; if (id === 'areas') loadAreas(); renderQueue(); },
     }, label, h('span', { class: 'count' }, count));
     return h('div', { class: 'q-tabs', role: 'tablist', 'aria-label': 'Queue view' },
-      tab('queue', 'Queue', state.data.unscheduled.length), tab('areas', 'Areas', areaOptions().length));
+      tab('queue', 'Queue', state.data.unscheduled.length), tab('areas', 'Areas', areaOptions().length),
+      tab('booked', 'Booked', state.data.bookings.length));
+  }
+
+  // ----------------------------------------------------------------- booked
+  // Slots confirmed in this app that Housecall Pro does not show yet: the dispatcher's "enter these in HCP" list.
+  function renderBooked() {
+    const list = state.data.bookings, today = state.data.today;
+    const head = h('header', { class: 'q-head' }, viewTabs(),
+      h('div', { class: 'q-title' }, h('h2', {}, 'Booked here'), h('span', { class: 'count' }, String(list.length))));
+    const card = (b) => {
+      const open = () => openBooked(b);
+      return h('div', { class: 'bk-card', role: 'listitem', tabindex: '0', style: { '--c': b.tech_color || '#2563eb' }, 'data-id': b.job_id, onclick: open, onkeydown: onEnter(open) },
+        h('div', { class: 'bk-top' }, h('span', { class: 'dot' }), h('b', {}, b.tech_name),
+          h('span', { class: 'bk-when' }, `${dayWord(b.date, today)} · ${fmtMinutes(b.window_start_min)} – ${fmtMinutes(b.window_end_min)}`)),
+        h('div', { class: 'q-name' }, b.customer_name || 'Unknown customer'),
+        h('div', { class: 'q-addr' }, b.address || 'No address on this job'),
+        h('div', { class: 'bk-meta dim' }, `Arrive about ${fmtMinutes(b.arrive_min)} · ${fmtDuration(b.duration_min)} · booked${b.booked_by ? ` by ${b.booked_by}` : ''} ${timeAgo(b.booked_at)}`),
+        b.note ? h('div', { class: 'bk-note' }, b.note) : null,
+        h('div', { class: 'bk-actions' },
+          b.hcp_url ? h('a', { class: 'btn', href: b.hcp_url, target: '_blank', rel: 'noopener noreferrer', onclick: (e) => e.stopPropagation() }, icon('link', 13), ' Open in Housecall Pro') : null,
+          h('button', { class: 'btn', type: 'button', onclick: (e) => { e.stopPropagation(); removeBooking(b.job_id); } }, icon('x', 12), ' Remove')));
+    };
+    const body = h('div', { class: 'q-list bk-list', role: 'list' },
+      h('p', { class: 'dim hint bk-hint' }, 'Confirmed here but still unscheduled in Housecall Pro. Enter each one in Housecall Pro so it reaches the technician; it leaves this list once Housecall Pro shows it scheduled.'),
+      list.length ? list.map(card) : h('div', { class: 'empty' }, 'Nothing booked yet. Open a job, choose Find best slot, then confirm a slot.'));
+    const keep = queue.querySelector('.q-list'); const scroll = keep ? keep.scrollTop : 0;
+    render(queue, head, body);
+    body.scrollTop = scroll;
+  }
+  function openBooked(b) {
+    if (b.date !== state.date) { state.date = b.date; load({ quiet: true }); }
+    select(b.job_id);
+  }
+  async function removeBooking(id) {
+    if (!window.confirm('Remove this booking? The call goes back to the unscheduled queue. Housecall Pro is not changed.')) return;
+    try { await api.unbook(id); toast('Booking removed: the call is back in the queue', 'ok'); }
+    catch (e) { toast(e.message, 'error'); }
+    if (state.selectedId === id) await refreshJob(id);
+    else { await load({ quiet: true, detail: true }); if (state.areas) loadAreas({ quiet: true }); }
   }
 
   // ------------------------------------------------------------------ areas
@@ -249,9 +292,9 @@ export function mountDispatch(root, ctx) {
   // ------------------------------------------------------------------- detail
   async function select(id) {
     state.selectedId = id; state.detail = null; state.detailLoading = true;
-    state.slots = null; state.slotsFor = null; state.hoverOpt = state.pinnedOpt = null;
+    state.slots = null; state.slotsFor = null; state.hoverOpt = state.pinnedOpt = null; state.bookNote = ''; state.bookError = null;
     renderQueue(); renderMap(false);
-    const u = state.data && state.data.unscheduled.find((x) => x.id === id);
+    const u = state.data && (state.data.unscheduled.find((x) => x.id === id) || state.data.bookings.find((x) => x.job_id === id));
     if (u && u.lat != null) map.panTo(u.lat, u.lng);
     try { state.detail = await api.job(id); } catch (e) { toast(e.message, 'error'); state.selectedId = null; }
     state.detailLoading = false;
@@ -259,6 +302,7 @@ export function mountDispatch(root, ctx) {
   }
   function back() {
     state.selectedId = null; state.detail = null; state.slots = null; state.slotsFor = null; state.hoverOpt = state.pinnedOpt = null;
+    state.bookNote = ''; state.bookError = null;
     renderQueue(); renderMap(false);
   }
 
@@ -268,14 +312,14 @@ export function mountDispatch(root, ctx) {
   function renderDetail() {
     const u = state.data.unscheduled.find((x) => x.id === state.selectedId);
     const d = state.detail;
-    const backBtn = h('button', { class: 'btn ghost', type: 'button', onclick: back }, icon('left', 14), ' Unscheduled');
+    const backBtn = h('button', { class: 'btn ghost', type: 'button', onclick: back }, icon('left', 14), state.view === 'booked' ? ' Booked' : ' Unscheduled');
     if (!d) { render(queue, h('header', { class: 'q-head' }, backBtn), h('div', { class: 'd-body' }, h('div', { class: 'empty' }, state.detailLoading ? 'Loading…' : 'Job not found.'))); return; }
     const w = d.warranty, sc = d.score;
     const hdr = h('header', { class: 'q-head d-head' },
       h('div', { class: 'd-toprow' }, backBtn, d.hcp_url ? h('a', { class: 'btn ghost', href: d.hcp_url, target: '_blank', rel: 'noopener noreferrer' }, icon('link', 14), ' Open in Housecall Pro') : null),
       h('h2', { class: 'd-name' }, d.customer_name || 'Unknown customer'),
       h('div', { class: 'd-badges' }, badge(sc.priority_label, `prio prio-${PRIO_CLASS(sc.priority_label)}`), badge(SOURCE_LABEL[d.source_category], `src src-${d.source_category}`),
-        d.trade_code ? badge(d.trade_code, 'trade') : null, d.work_status !== 'unscheduled' ? badge(d.work_status.replace('_', ' '), 'dim') : null));
+        d.trade_code ? badge(d.trade_code, 'trade') : null, d.work_status !== 'unscheduled' ? badge(d.work_status.replace('_', ' '), 'dim') : null, d.booking ? badge('booked here', 'src') : null));
 
     const alerts = [];
     if (w && w.do_not_collect_service_fee) alerts.push(h('div', { class: 'alert fee' }, h('b', {}, 'Do not collect the trade service fee.'), w.payment_type ? ` Payment type: ${w.payment_type}.` : ''));
@@ -296,7 +340,7 @@ export function mountDispatch(root, ctx) {
     const windowSel = h('select', { 'aria-label': 'Arrival window length', onchange: (e) => { state.slotWindow = Number(e.target.value); if (state.slots) findSlots(); } },
       [...new Set([60, 120, 180, 240, 300, 360, 480, state.slotWindow])].sort((x, y) => x - y)
         .map((m) => h('option', { value: m, selected: m === state.slotWindow }, fmtDuration(m))));
-    const slotPanel = h('section', { class: 'd-sec slots' },
+    const slotPanel = d.booking ? null : h('section', { class: 'd-sec slots' },
       h('div', { class: 'slots-head' }, h('h3', {}, 'Best slots'),
         h('div', { class: 'slots-ctl' }, h('label', { class: 'dim', title: 'How long a time window the customer is given to expect the technician in' }, 'Window ', windowSel),
           h('label', { class: 'dim' }, 'Search ', daysSel),
@@ -331,7 +375,24 @@ export function mountDispatch(root, ctx) {
 
     const raw = h('details', { class: 'd-sec raw' }, h('summary', {}, 'Original description from Housecall Pro'), h('pre', {}, d.description_raw || '(empty)'));
 
-    render(queue, hdr, h('div', { class: 'd-body' }, alerts, scoreCard, exceptionPanel(d), slotPanel, section('Problem', items), contact, warranty, breakdown, warnings, raw));
+    render(queue, hdr, h('div', { class: 'd-body' }, alerts, d.booking ? [bookingPanel(d), scoreCard] : [scoreCard, exceptionPanel(d), slotPanel],
+      section('Problem', items), contact, warranty, breakdown, warnings, raw));
+    const box = queue.querySelector('.confirm');          // a re-render starts the panel at the top: keep the confirm button in view
+    if (box) box.scrollIntoView({ block: 'nearest' });
+  }
+
+  // --------------------------------------------------------------- booked job
+  function bookingPanel(d) {
+    const b = d.booking;
+    return h('section', { class: 'd-sec booked', style: { '--c': b.tech_color || '#2563eb' } },
+      h('h3', {}, icon('check', 13), ' Booked'),
+      h('div', { class: 'bk-what' }, h('span', { class: 'dot' }), h('b', {}, b.tech_name), ` · ${fmtDay(b.date, { weekday: 'long', month: 'short', day: 'numeric' })}`),
+      h('dl', {},
+        kv('Customer is told', `between ${fmtMinutes(b.window_start_min)} and ${fmtMinutes(b.window_end_min)}`),
+        kv('Planned arrival', `about ${fmtMinutes(b.arrive_min)}, done around ${fmtMinutes(b.end_min)}`),
+        kv('Note', b.note), kv('Booked', `${b.booked_by ? `by ${b.booked_by} · ` : ''}${fmtDateTime(b.booked_at)}`)),
+      h('div', { class: 'alert warn' }, icon('alert', 14), ' Saved in this app only. Housecall Pro does not know about it yet: schedule it there too so it reaches the technician. It leaves the Booked list once Housecall Pro shows it scheduled.'),
+      h('div', { class: 'exc-actions' }, h('button', { class: 'btn', type: 'button', onclick: () => removeBooking(d.id) }, icon('x', 12), ' Remove booking')));
   }
 
   // ------------------------------------------------------------ deadline waived
@@ -370,7 +431,7 @@ export function mountDispatch(root, ctx) {
 
   // ----------------------------------------------------------------- slots UI
   async function findSlots() {
-    const id = state.selectedId; state.slotsLoading = true; state.hoverOpt = state.pinnedOpt = null;
+    const id = state.selectedId; state.slotsLoading = true; state.hoverOpt = state.pinnedOpt = null; state.bookError = null;
     renderQueue();
     try { state.slots = await api.slots(id, state.slotDays, state.slotWindow); state.slotsFor = id; }
     catch (e) { toast(e.message, 'error'); state.slots = null; }
@@ -379,10 +440,11 @@ export function mountDispatch(root, ctx) {
   }
   function renderSlots(d) {
     const s = state.slots;
-    if (!s || state.slotsFor !== d.id) return h('p', { class: 'dim hint' }, 'Finds the cheapest place in each technician’s day (least added driving) and offers an arrival window to book. Windows may overlap, and a nearby job is offered the same window. Skills, shifts, existing windows and priority are respected. Suggestions only: nothing is written to Housecall Pro.');
-    const out = [h('p', { class: 'dim hint' }, `${fmtDuration(s.duration_min)} job · ${fmtDuration(s.window_minutes)} arrival windows (they may overlap) · searched ${s.search_days} day${s.search_days === 1 ? '' : 's'} · ranking uses straight-line drive estimates`)];
+    if (!s || state.slotsFor !== d.id) return h('p', { class: 'dim hint' }, 'Finds the cheapest place in each technician’s day (least added driving) and offers an arrival window to book. Windows may overlap, and a nearby job is offered the same window. Skills, shifts, existing windows and priority are respected. Pick a slot to preview it on the map, then confirm it to add the job to that technician’s route. Saved in this app only: nothing is written to Housecall Pro.');
+    const out = [state.bookError ? h('div', { class: 'alert warn', role: 'alert' }, icon('alert', 14), ' ', state.bookError) : null,
+      h('p', { class: 'dim hint' }, `${fmtDuration(s.duration_min)} job · ${fmtDuration(s.window_minutes)} arrival windows (they may overlap) · searched ${s.search_days} day${s.search_days === 1 ? '' : 's'} · ranking uses straight-line drive estimates`)];
     if (!s.options.length) out.push(h('div', { class: 'alert warn' }, icon('alert', 14), ' ', s.notes[0] || 'No feasible slot found.'));
-    s.options.forEach((o, i) => out.push(slotCard(o, i)));
+    s.options.forEach((o, i) => { out.push(slotCard(o, i)); if (isPinned(o)) out.push(confirmBox(o, s)); });
     if (s.notes.length && s.options.length) s.notes.forEach((n) => out.push(h('p', { class: 'dim hint' }, n)));
     if (s.ineligible.length) out.push(h('details', { class: 'inel' }, h('summary', {}, `${s.ineligible.length} technician${s.ineligible.length === 1 ? '' : 's'} not suggested`),
       h('ul', {}, s.ineligible.map((x) => h('li', {}, h('b', {}, x.name), ` – ${x.reason}`)))));
@@ -394,9 +456,10 @@ export function mountDispatch(root, ctx) {
     const text = list.slice(0, 2).map(one).join('; ') + (list.length > 2 ? `; and ${list.length - 2} more nearby` : '');
     return text.charAt(0).toUpperCase() + text.slice(1);
   }
+  const isPinned = (o) => !!state.pinnedOpt && state.pinnedOpt.tech_id === o.tech_id && state.pinnedOpt.date === o.date;
   function slotCard(o, i) {
-    const pinned = state.pinnedOpt && state.pinnedOpt.tech_id === o.tech_id && state.pinnedOpt.date === o.date;
-    const pick = () => { state.pinnedOpt = pinned ? null : o; if (!pinned && o.date !== state.date) { state.date = o.date; load({ detail: true }); } else { renderQueue(); renderMap(false); } };
+    const pinned = isPinned(o);
+    const pick = () => { if (state.booking) return; state.bookError = null; state.pinnedOpt = pinned ? null : o; if (!pinned && o.date !== state.date) { state.date = o.date; load({ detail: true }); } else { renderQueue(); renderMap(false); } };
     return h('div', {
       class: `slot${pinned ? ' pinned' : ''}${o.misses_deadline ? ' miss' : ''}`, role: 'button', tabindex: '0', style: { '--c': o.tech_color || '#2563eb' },
       onclick: pick, onkeydown: onEnter(pick),
@@ -408,6 +471,56 @@ export function mountDispatch(root, ctx) {
     o.stacked_with && o.stacked_with.length ? h('div', { class: 'slot-stack' }, icon('check', 12), ' ', stackText(o.stacked_with)) : null,
     o.misses_deadline ? h('div', { class: 'slot-warn' }, icon('alert', 12), ' Finishes after the deadline target') : null,
     o.date !== state.date ? h('div', { class: 'slot-hint dim' }, 'Click to view this day on the map') : null);
+  }
+
+  // Nothing is booked by picking a slot: it is previewed on the map, and only this box's button books it.
+  function confirmBox(o, s) {
+    const row = (k, v) => h('div', { class: 'kv' }, h('dt', {}, k), h('dd', {}, v));
+    const note = h('input', { type: 'text', maxlength: 300, placeholder: 'Note (optional), e.g. customer prefers mornings', 'aria-label': 'Booking note', value: state.bookNote,
+      oninput: (e) => { state.bookNote = e.target.value; }, onkeydown: (e) => { if (e.key === 'Enter') { e.preventDefault(); confirmBooking(o, s); } } });
+    return h('div', { class: 'confirm', role: 'group', 'aria-label': 'Confirm booking', style: { '--c': o.tech_color || '#2563eb' } },
+      h('h4', {}, 'Confirm this booking?'),
+      h('dl', {},
+        row('Technician', o.tech_name), row('Day', fmtDay(o.date, { weekday: 'long', month: 'short', day: 'numeric' })),
+        row('Customer is told', `between ${fmtMinutes(o.window_start_min)} and ${fmtMinutes(o.window_end_min)}`),
+        row('Planned arrival', `about ${fmtMinutes(o.start_min)} · ${fmtDuration(s.duration_min)} on site`),
+        row('On the route', `stop ${o.position} of ${o.stops_in_day + 1} · +${Math.round(o.added_drive_min)} min driving`)),
+      o.stacked_with && o.stacked_with.length ? h('div', { class: 'slot-stack' }, icon('check', 12), ' ', stackText(o.stacked_with)) : null,
+      o.misses_deadline ? h('div', { class: 'slot-warn' }, icon('alert', 12), ' Finishes after the deadline target') : null,
+      note,
+      h('div', { class: 'exc-actions' },
+        h('button', { class: 'btn primary', type: 'button', disabled: state.booking, onclick: () => confirmBooking(o, s) }, icon('check', 14), state.booking ? ' Booking…' : ' Confirm booking'),
+        h('button', { class: 'btn', type: 'button', disabled: state.booking, onclick: () => { state.pinnedOpt = null; renderQueue(); renderMap(false); } }, 'Cancel')),
+      h('p', { class: 'dim hint' }, 'Saved in this app and added to this technician’s route here. Housecall Pro is not updated: schedule it there too so it reaches the technician.'));
+  }
+  // The server checks the slot again before booking, so a route that changed meanwhile is refused (409), never booked wrongly.
+  async function confirmBooking(o, s) {
+    const id = state.selectedId;
+    if (!id || state.booking) return;
+    state.booking = true; state.bookError = null; renderQueue();
+    try {
+      const r = await api.book(id, { tech_id: o.tech_id, date: o.date, window_start_min: o.window_start_min, window_end_min: o.window_end_min,
+        window_minutes: s.window_minutes, after_stop_id: o.after_stop_id, before_stop_id: o.before_stop_id, note: state.bookNote });
+      const b = r.booking;
+      state.booking = false; state.bookNote = ''; state.slots = null; state.slotsFor = null; state.hoverOpt = state.pinnedOpt = null;
+      toast(`Booked with ${b.tech_name}: ${fmtDay(b.date)}, ${fmtMinutes(b.window_start_min)} – ${fmtMinutes(b.window_end_min)}`, 'ok', 6000);
+      state.date = b.date;
+      if (state.selectedId === id) {
+        await refreshJob(id);
+        const at = state.data && state.data.bookings.find((x) => x.job_id === id);
+        if (at && at.lat != null && state.selectedId === id) map.panTo(at.lat, at.lng);
+      } else await load({ quiet: true, detail: true });
+    } catch (e) {
+      state.booking = false;
+      if (state.selectedId !== id) return;
+      if (e.status === 409) {
+        toast(e.message, 'error', 7000);
+        await refreshJob(id);                                                    // booked by someone else, or already in HCP: show the truth
+        if (state.selectedId === id && state.detail && !state.detail.booking && state.detail.work_status === 'unscheduled') await findSlots();
+        state.bookError = e.message;
+      } else state.bookError = e.message;
+      if (state.selectedId === id) renderQueue();
+    }
   }
 
   // --------------------------------------------------------------------- map
@@ -433,12 +546,20 @@ export function mountDispatch(root, ctx) {
     return el;
   }
   function makeStop(s, t) {
-    const done = s.status === 'complete', prog = s.status === 'in_progress';
-    const el = h('div', { class: `stop${done ? ' done' : ''}${prog ? ' prog' : ''}`, style: { '--c': t ? t.color : '#64748b' } }, done ? icon('check', 14) : s.seq ? String(s.seq) : '·');
+    const done = s.status === 'complete', prog = s.status === 'in_progress', booked = !!s.booked;
+    const el = h('div', { class: `stop${done ? ' done' : ''}${prog ? ' prog' : ''}${booked ? ' booked' : ''}${booked && s.id === state.selectedId ? ' sel' : ''}`, style: { '--c': t ? t.color : '#64748b' } },
+      done ? icon('check', 14) : s.seq ? String(s.seq) : '·');
     const head = done ? `Completed${s.completed_iso ? ' ' + fmtTime(s.completed_iso) : ''} · ${s.customer_name || 'Customer'}`
-      : prog ? `In progress · ${s.customer_name || 'Customer'}` : `${s.customer_name || 'Customer'}`;
-    const when = done ? '' : `Window ${fmtMinutes(s.window_start_min)}–${fmtMinutes(s.window_end_min)} · job ${fmtTime(s.start_iso)}–${fmtTime(s.end_iso)}`;
-    map.tip(el, [head, when, s.address, s.summary, t ? `${t.name} · stop ${s.seq}` : 'No technician assigned'].filter(Boolean));
+      : prog ? `In progress · ${s.customer_name || 'Customer'}` : booked ? `Booked here · ${s.customer_name || 'Customer'}` : `${s.customer_name || 'Customer'}`;
+    const when = done ? '' : booked ? `Window ${fmtMinutes(s.window_start_min)}–${fmtMinutes(s.window_end_min)} · arrive about ${fmtTime(s.start_iso)}`
+      : `Window ${fmtMinutes(s.window_start_min)}–${fmtMinutes(s.window_end_min)} · job ${fmtTime(s.start_iso)}–${fmtTime(s.end_iso)}`;
+    map.tip(el, [head, when, s.address, s.summary, t ? `${t.name} · stop ${s.seq}` : 'No technician assigned',
+      booked ? 'Not in Housecall Pro yet · click to open the booking' : null].filter(Boolean));
+    if (booked) {
+      el.setAttribute('role', 'button'); el.tabIndex = 0;
+      const open = () => select(s.id);
+      el.addEventListener('click', open); el.addEventListener('keydown', onEnter(open));
+    }
     return el;
   }
 
@@ -555,6 +676,6 @@ function buildLegend() {
     h('div', { class: 'lg-row' }, h('b', {}, 'Shape'), shape('ahs', 'AHS'), shape('other', 'Other warranty'), shape('direct', 'Direct lead')),
     h('div', { class: 'lg-row' }, h('b', {}, 'Color'), dot('prio-emergency', 'Emergency'), dot('prio-expedited', 'Expedited'), dot('prio-normal', 'Normal'), dot('prio-direct', 'Direct')),
     h('div', { class: 'lg-row' }, h('b', {}, 'Ring'), dot('ring-warning', 'deadline closing'), dot('ring-critical', 'critical'), dot('ring-overdue', 'overdue'), h('span', { class: 'dim' }, '(none = deadline waived or no deadline)')),
-    h('div', { class: 'lg-row dim' }, 'Numbers = queue rank · water drop = urgency keyword · colored circles = scheduled stops by technician (✓ = finished) · hover a route line for its drive time'));
+    h('div', { class: 'lg-row dim' }, 'Numbers = queue rank · water drop = urgency keyword · colored circles = scheduled stops by technician (✓ = finished, dashed = booked here, not in Housecall Pro yet) · hover a route line for its drive time'));
   return el;
 }

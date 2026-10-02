@@ -69,6 +69,8 @@ class AuthTests(ApiBase):
         self.assertEqual(c.post("/api/sync/run").status, 401)
         self.assertEqual(c.put("/api/jobs/x/exception", {"reason": "other", "note": "x"}).status, 401)
         self.assertEqual(c.delete("/api/jobs/x/exception").status, 401)
+        self.assertEqual(c.post("/api/jobs/x/booking", {"tech_id": "t"}).status, 401)
+        self.assertEqual(c.delete("/api/jobs/x/booking").status, 401)
 
     def test_csrf_header_required_for_mutations(self):
         c = Client(self.app, csrf=False)
@@ -320,6 +322,104 @@ class WindowApiTests(ApiBase):
         while d.weekday() >= 5:
             d -= timedelta(days=1)
         return d.isoformat()
+
+
+class BookingApiTests(ApiBase):
+    """Pick a suggested slot, confirm it, see it on the route; refuse stale or repeated confirmations."""
+
+    def setUp(self):
+        with self.app.state.db.session() as c:
+            c.execute("DELETE FROM bookings")
+
+    def first_slot(self, window=None):
+        top = next(u for u in self.disp.get("/api/dispatch").json()["unscheduled"] if u["lat"] is not None)
+        res = self.disp.post(f"/api/jobs/{top['id']}/slots", {"days": 7, **({"window_minutes": window} if window else {})}).json()
+        return top["id"], res, res["options"][0]
+
+    @staticmethod
+    def body(res, o, **extra):
+        return {"tech_id": o["tech_id"], "date": o["date"], "window_start_min": o["window_start_min"],
+                "window_end_min": o["window_end_min"], "window_minutes": res["window_minutes"],
+                "after_stop_id": o["after_stop_id"], "before_stop_id": o["before_stop_id"], **extra}
+
+    def test_confirm_adds_the_job_to_the_route(self):
+        jid, res, o = self.first_slot()
+        r = self.disp.post(f"/api/jobs/{jid}/booking", self.body(res, o, note="Prefers mornings"))
+        self.assertEqual(r.status, 201, r.text)
+        b = r.json()["booking"]
+        self.assertEqual((b["job_id"], b["tech_id"], b["date"], b["note"]), (jid, o["tech_id"], o["date"], "Prefers mornings"))
+        self.assertEqual((b["window_start_min"], b["window_end_min"]), (o["window_start_min"], o["window_end_min"]))
+        self.assertEqual(b["booked_by"], "Dee")
+        v = self.disp.get(f"/api/dispatch?date={o['date']}").json()
+        self.assertNotIn(jid, [u["id"] for u in v["unscheduled"]])
+        stop = next(s for t in v["technicians"] if t["id"] == o["tech_id"] for s in t["stops"] if s["id"] == jid)
+        self.assertEqual((stop["booked"], stop["seq"]), (True, o["position"]))
+        (listed,) = v["bookings"]
+        self.assertEqual((listed["job_id"], listed["customer_name"] != ""), (jid, True))
+        d = self.disp.get(f"/api/jobs/{jid}").json()
+        self.assertEqual(d["booking"]["tech_id"], o["tech_id"])
+        self.assertEqual(d["work_status"], "unscheduled")                 # Housecall Pro still says so
+        self.assertEqual(self.disp.get("/api/areas").json()["totals"]["unscheduled"], len(v["unscheduled"]))
+
+    def test_nothing_is_written_to_housecall_pro(self):
+        jid, res, o = self.first_slot()
+        before = [dict(j) for j in self.app.state.hcp.dataset["jobs"]]
+        self.assertEqual(self.disp.post(f"/api/jobs/{jid}/booking", self.body(res, o)).status, 201)
+        self.assertEqual(self.app.state.hcp.dataset["jobs"], before)
+
+    def test_a_job_can_only_be_booked_once_and_slots_are_refused_meanwhile(self):
+        jid, res, o = self.first_slot()
+        self.assertEqual(self.disp.post(f"/api/jobs/{jid}/booking", self.body(res, o)).status, 201)
+        again = self.disp.post(f"/api/jobs/{jid}/booking", self.body(res, o))
+        self.assertEqual(again.status, 409)
+        self.assertIn("already booked", again.json()["error"])
+        self.assertEqual(self.disp.post(f"/api/jobs/{jid}/slots", {}).status, 400)
+
+    def test_a_stale_suggestion_is_a_conflict_not_a_wrong_booking(self):
+        jid, res, o = self.first_slot()
+        r = self.disp.post(f"/api/jobs/{jid}/booking", self.body(res, o, window_start_min=o["window_start_min"] + 60,
+                                                                  window_end_min=o["window_end_min"] + 60))
+        self.assertEqual(r.status, 409)
+        self.assertIn("Find best slot again", r.json()["error"])
+        with self.app.state.db.session() as c:
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM bookings").fetchone()[0], 0)
+
+    def test_the_window_length_chosen_for_the_search_is_the_one_booked(self):
+        jid, res, o = self.first_slot(window=120)
+        self.assertEqual(res["window_minutes"], 120)
+        b = self.disp.post(f"/api/jobs/{jid}/booking", self.body(res, o)).json()["booking"]
+        self.assertLessEqual(b["window_end_min"] - b["window_start_min"], 120)
+
+    def test_bad_requests(self):
+        jid, res, o = self.first_slot()
+        for bad in ({}, self.body(res, o, date="soon"), self.body(res, o, tech_id=5), self.body(res, o, note="x" * 400),
+                    self.body(res, o, window_start_min="8")):
+            self.assertEqual(self.disp.post(f"/api/jobs/{jid}/booking", bad).status, 400, bad)
+        self.assertEqual(self.disp.post("/api/jobs/nope/booking", self.body(res, o)).status, 404)
+        self.assertEqual(self.disp.request("POST", f"/api/jobs/{jid}/booking", headers={"content-type": "application/json"}).status, 400)
+        sched = next(j for j in self.app.state.hcp.dataset["jobs"] if j["work_status"] == "scheduled")["id"]
+        self.assertEqual(self.disp.post(f"/api/jobs/{sched}/booking", self.body(res, o)).status, 409)
+
+    def test_the_csrf_header_is_required(self):
+        jid, res, o = self.first_slot()
+        self.assertEqual(self.disp.post(f"/api/jobs/{jid}/booking", self.body(res, o), csrf=False).status, 403)
+        self.assertEqual(self.disp.delete(f"/api/jobs/{jid}/booking", csrf=False).status, 403)
+
+    def test_removing_a_booking_returns_the_job_to_the_queue(self):
+        jid, res, o = self.first_slot()
+        self.assertEqual(self.disp.delete(f"/api/jobs/{jid}/booking").status, 404)       # nothing to remove yet
+        self.disp.post(f"/api/jobs/{jid}/booking", self.body(res, o))
+        self.assertEqual(self.disp.delete(f"/api/jobs/{jid}/booking").status, 200)
+        self.assertEqual(self.disp.delete(f"/api/jobs/{jid}/booking").status, 404)
+        v = self.disp.get(f"/api/dispatch?date={o['date']}").json()
+        self.assertIn(jid, [u["id"] for u in v["unscheduled"]])
+        self.assertEqual(v["bookings"], [])
+        self.assertEqual(self.disp.post(f"/api/jobs/{jid}/slots", {"days": 7}).status, 200)
+
+    def test_an_admin_can_book_too(self):
+        jid, res, o = self.first_slot()
+        r = self.admin.post(f"/api/jobs/{jid}/booking", self.body(res, o))
+        self.assertEqual((r.status, r.json()["booking"]["booked_by"]), (201, "Admin"))
 
 
 class AreasApiTests(ApiBase):

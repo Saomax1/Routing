@@ -28,7 +28,8 @@ if it adds more driving) + a penalty if the job would finish after its deadline.
 is kept, then the top N overall are returned. ``soonest=True`` ranks by planned arrival instead (earlier day first,
 then earlier arrival, drive time only breaks ties); the Areas tab uses it to answer "who has an opening first?".
 
-A stop without window fields has a zero-width window (a fixed time), so older callers behave as before.
+A stop without window fields has a zero-width window (a fixed time), so older callers behave as before. Stops are
+taken in order of planned arrival (``start_min``), ties broken by window start.
 
 Pure functions only - no database, no network. Travel time comes from a ``TravelTimeProvider``.
 """
@@ -86,8 +87,11 @@ def _overlaps(ws: int, we: int, other: Stop) -> bool:
 
 
 def _order_key(s: Stop):
+    """Route order = planned arrival. For a job HCP schedules that is its scheduled start (the window start); a job
+    booked here keeps the arrival it was booked with, so it stays where the dispatcher put it even though its window
+    may open earlier than the stop before it."""
     ws, _ = _window(s)
-    return ws, s["start_min"], str(s.get("id"))
+    return s["start_min"], ws, str(s.get("id"))
 
 
 def find_best_slots(

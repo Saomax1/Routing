@@ -31,6 +31,8 @@ from .db import jdump, jload, utcnow_iso
 from .domain.timeutil import hhmm_to_minutes, parse_date
 from .domain.travel import HaversineTravel
 from .security import MIN_PASSWORD_LENGTH, ROLES, burn_verify, hash_password, verify_password
+from .services import bookings
+from .services.confirm_slot import BookingConflict, confirm_slot
 from .services.dispatch_view import build_areas, build_dispatch, build_job_detail, compute_slots, load_technicians
 from .services.geocode import geocode_cached
 from .services.job_exceptions import clear_exception, reason_options, set_exception
@@ -211,6 +213,29 @@ def job_slots(ctx: Ctx, body):
     if res is None:
         raise ApiError(404, "Job not found")
     return res
+
+
+@endpoint(body=True)
+def booking_create(ctx: Ctx, body):
+    """Confirm one of the suggested slots: the job is booked for that technician and joins their route.
+    Saved in this app only (nothing is written to HCP). The body names the suggestion the dispatcher saw."""
+    try:
+        with ctx.db.session() as conn:
+            res = confirm_slot(conn, ctx.path["job_id"], body, now_utc(), ctx.user["id"])
+    except BookingConflict as e:
+        raise ApiError(409, str(e))
+    if res is None:
+        raise ApiError(404, "Job not found")
+    return res, 201
+
+
+@endpoint()
+def booking_delete(ctx: Ctx, _):
+    """Take a booking away: the job goes back to the unscheduled queue."""
+    with ctx.db.session() as conn:
+        if not bookings.remove(conn, ctx.path["job_id"], now_utc(), ctx.user["id"]):
+            raise ApiError(404, "This job has no booking")
+    return {"ok": True}
 
 
 def _days_param(raw) -> Optional[int]:
@@ -489,6 +514,8 @@ ROUTES = [
     Route("/api/dispatch", dispatch),
     Route("/api/jobs/{job_id}", job_detail),
     Route("/api/jobs/{job_id}/slots", job_slots, methods=["POST"]),
+    Route("/api/jobs/{job_id}/booking", booking_create, methods=["POST"]),
+    Route("/api/jobs/{job_id}/booking", booking_delete, methods=["DELETE"]),
     Route("/api/jobs/{job_id}/exception", exception_put, methods=["PUT"]),
     Route("/api/jobs/{job_id}/exception", exception_delete, methods=["DELETE"]),
     Route("/api/areas", areas),

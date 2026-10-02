@@ -7,6 +7,7 @@ Every run:
   2. for each job: normalise, parse warranty text (only if the description changed), geocode
      (cached; only if the address changed), upsert
   3. marks open jobs HCP no longer returns (inside our window) as inactive so they leave the map
+  4. forgets bookings made in this app that HCP now shows as scheduled (see services/bookings.py)
 
 Design notes
 * Read-only against HCP in this phase.
@@ -32,6 +33,7 @@ from ..domain.warranty_parser import looks_like_warranty, missing_key_fields, pa
 from ..hcp.normalize import (canonical_trade, classify_source, guess_trade_from_text, normalize_employee,
                              normalize_job)
 from .ai_fallback import ai_fill
+from .bookings import drop_stale
 from .geocode import geocode_cached
 from .settings_store import get_settings, seed_durations
 
@@ -127,6 +129,7 @@ class SyncService:
                 if in_window:
                     conn.execute("UPDATE jobs SET active = 0 WHERE hcp_job_id = ?", (r["hcp_job_id"],))
                     changed += 1
+            drop_stale(conn, now)          # bookings HCP has caught up with, or whose window has ended
             conn.commit()
         finally:
             conn.close()

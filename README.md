@@ -4,8 +4,10 @@ An in-house dispatch assistant for a home-service company that uses Housecall Pr
 scheduled jobs on a map, reads AHS / Frontdoor-style warranty descriptions, ranks the unscheduled queue by urgency, and
 suggests the best technician and time slot for each job using cheapest-insertion routing.
 
-**Status: Phase 0 tooling + Phase 1 (read-only MVP).** The app never writes to Housecall Pro. Write-back, webhooks,
-cluster suggestions and the compliance tracker are Phase 2 and are not built (see [Known gaps](#known-gaps)).
+**Status: Phase 0 tooling + Phase 1 (read-only MVP).** The app never writes to Housecall Pro. A dispatcher can confirm a
+suggested slot, which books the job here and adds it to the technician's route in this app (see *Confirming a slot*
+below); it still has to be entered in Housecall Pro. Write-back, webhooks, cluster suggestions and the compliance tracker
+are Phase 2 and are not built (see [Known gaps](#known-gaps)).
 
 ## Quick start (demo data, no API key needed)
 
@@ -38,8 +40,8 @@ touches real data).
 python -m unittest discover -s tests -t .
 ```
 
-232 tests cover the warranty parser, scoring, travel and slot engines, arrival windows, completed jobs, deadline
-exceptions, area totals, road routing, the sync pipeline and the API (auth, roles, CSRF, rate limiting). All fixtures are sanitized fake data. The suite uses
+274 tests cover the warranty parser, scoring, travel and slot engines, arrival windows, completed jobs, deadline
+exceptions, area totals, slot confirmation, road routing, the sync pipeline and the API (auth, roles, CSRF, rate limiting). All fixtures are sanitized fake data. The suite uses
 only the standard library `unittest`.
 
 ## Connecting to your real Housecall Pro account
@@ -126,6 +128,20 @@ See [`.env.example`](.env.example) for the full annotated list. The important on
   a window holding that arrival - the same window start, with a note like "same window as Jane (12 min away)"; windows
   that merely overlap are labelled as such. If a job is already past its deadline, options are ranked by speed and cost
   and the card says so. The Areas tab runs the same engine in a "soonest opening" mode.
+- **Confirming a slot** (`app/services/confirm_slot.py`, `app/services/bookings.py`,
+  `POST /api/jobs/{id}/booking`): picking a slot card only previews it on the map. A box under it lists what will be booked
+  (technician, day, the window the customer is told, planned arrival, place on the route, an optional note); only its
+  **Confirm booking** button books it. The job then leaves the unscheduled queue and the area totals, becomes a dashed
+  stop on that technician's route, and every later *Find best slot* plans around it. The browser only says which
+  suggestion it saw; the server searches that technician's day again under a write lock and books only if the same
+  window and neighbouring stops are still on offer, using its own recomputed times. So two dispatchers cannot take the
+  same hole, and a route that changed meanwhile (another booking, a sync, time passing) gives "no longer available, find
+  best slot again" and refreshes the options, never a wrong booking. **A booking lives in this app only**: Housecall
+  Pro is not updated, so the *Booked* tab lists what still has to be entered there (with an *Open in Housecall Pro*
+  link). A booking is dropped as soon as a sync shows the job scheduled in Housecall Pro (Housecall Pro is the truth),
+  and once its arrival window has ended without that, the job goes back to the queue instead of staying hidden.
+  *Remove booking* (job card or Booked tab, after a confirmation) puts it back at once. Who booked or removed what, and
+  when, is kept in the `schedule_actions` table.
 - **Completed jobs** (`app/services/sync.py`): each sync also pulls jobs HCP has marked complete (last
   `COMPLETED_LOOKBACK_DAYS`) and marks them `complete` here with their completion time. They stay on the map as dimmed
   check-marks in their technician's route (the toolbar shows "N completed", each technician chip "N done"), earlier
@@ -162,8 +178,9 @@ See [`.env.example`](.env.example) for the full annotated list. The important on
 - Full warranty descriptions and phone numbers are not written to logs. The front end renders HCP data with `textContent`
   only, since HCP text is untrusted.
 - Put it behind HTTPS before exposing it beyond your own machine, and set `SESSION_HTTPS_ONLY=true`.
-- The HCP client has no write methods; the ones that exist raise `NotImplementedError`. Phase 2 write-back must only
-  run on an explicit dispatcher action with a confirmation step.
+- The HCP client has no write methods; the ones that exist raise `NotImplementedError`. Confirming a slot saves the
+  booking in this app's database only. Phase 2 write-back must only run on an explicit dispatcher action with a
+  confirmation step: the confirm box and the server-side re-check are that step.
 
 ## Known gaps
 
@@ -179,6 +196,9 @@ See [`.env.example`](.env.example) for the full annotated list. The important on
 - **Stack deviation:** the original plan assumed FastAPI + React + Leaflet. The build sandbox could not install packages
   from PyPI or npm, so this uses Starlette + stdlib `sqlite3` + plain ES modules + a built-in map. Everything is
   standard and can be moved to a bigger stack later; the pure engines in `app/domain/` do not depend on the web layer.
+- **A confirmed booking is not sent to Housecall Pro.** Until Phase 2 write-back exists (it needs the HCP scheduling
+  and dispatch calls verified with the Phase 0 probe first), someone must enter each booking in Housecall Pro, so the
+  technician's own app and the customer notices do not know about it. The *Booked* tab is that to-do list.
 - **Not built yet (Phase 2):** write-back to HCP, `/api/webhooks`, route-cluster suggestions beyond the Areas tab,
   compliance tracker.
 - **Not built yet (Phase 3):** schedule optimization and reporting.
@@ -190,7 +210,7 @@ See [`.env.example`](.env.example) for the full annotated list. The important on
 app/            backend (api.py, main.py, config.py, db.py, security.py)
 app/domain/     pure logic: parser, scoring, travel, slots, time helpers
 app/hcp/        HCP client (live + mock), normalizer, demo fixtures
-app/services/   sync, geocoding, AI fallback, dispatch views, settings
+app/services/   sync, geocoding, AI fallback, dispatch views, settings, bookings, slot confirmation, road routes
 scripts/        phase0_probe.py, seed.py, create_user.py
 web/            no-build front end (index.html, css/, js/)
 tests/          unittest suite + sanitized fixtures
