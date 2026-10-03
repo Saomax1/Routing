@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from ..db import jload
 from ..domain.areas import area_of
 from ..domain.durations import estimate_minutes
+from ..domain.jobkind import TYPE_LABELS, classify_job
 from ..domain.scoring import score_job
 from ..domain.slots import Schedule, find_best_slots
 from ..domain.timeutil import at_local_minutes, minutes_of_day, parse_iso, to_iso
@@ -118,6 +119,7 @@ def load_unscheduled(conn, now: datetime) -> List[dict]:
 def unscheduled_entry(job: dict, warranty: Optional[dict], settings: dict, now: datetime,
                       exception: Optional[dict] = None) -> dict:
     sc = score_job(job, warranty, settings, now, exception)
+    kind = classify_job(job, settings, warranty)
     area_key, area_label = area_of(job, settings["areas"]["group_by"])
     return {
         "id": job["hcp_job_id"], "customer_name": job["customer_name"], "address": address_line(job),
@@ -125,8 +127,8 @@ def unscheduled_entry(job: dict, warranty: Optional[dict], settings: dict, now: 
         "area_key": area_key, "area": area_label,
         "exception_label": exception["reason_label"] if exception else None,
         "geocode_status": job["geocode_status"], "trade_code": job["trade_code"],
-        "source_category": job["source_category"], "lead_source": job["lead_source"],
-        "priority_label": sc["priority_label"], "score": sc["total"], "deadline_status": sc["deadline_status"],
+        "kind": kind["kind"], "type_label": kind["label"], "ad_lead": kind["ad_lead"],
+        "score": sc["total"], "deadline_status": sc["deadline_status"],
         "deadline_hours_left": sc["deadline_hours_left"], "age_hours": sc["age_hours"],
         "urgency_flags": sc["urgency_flags"], "summary": items_summary(job, warranty),
         "received_at": job["hcp_created_at"],
@@ -164,8 +166,7 @@ def _stop(job: dict, warranty: Optional[dict], seq: int, tz: ZoneInfo, settings:
         "booking_note": bk["note"] if bk else None,
         "completed_iso": job.get("completed_at"),
         "customer_name": job["customer_name"], "address": address_line(job), "trade_code": job["trade_code"],
-        "source_category": job["source_category"], "status": job["work_status"],
-        "priority_label": (warranty or {}).get("dispatch_priority") or "",
+        "type_label": classify_job(job, settings, warranty)["label"], "status": job["work_status"],
         "summary": items_summary(job, warranty),
     }
 
@@ -257,7 +258,8 @@ def build_bookings(conn, settings: dict, now: datetime) -> List[dict]:
         job = job_dict(conn.execute("SELECT * FROM jobs WHERE hcp_job_id = ?", (b["hcp_job_id"],)).fetchone())
         out.append({**bookings.public(b, tz), "customer_name": job["customer_name"], "address": address_line(job),
                     "lat": job["lat"], "lng": job["lng"], "trade_code": job["trade_code"],
-                    "source_category": job["source_category"], "summary": items_summary(job, wmap.get(b["hcp_job_id"])),
+                    "type_label": classify_job(job, settings, wmap.get(b["hcp_job_id"]))["label"],
+                    "summary": items_summary(job, wmap.get(b["hcp_job_id"])),
                     "hcp_url": template.replace("{id}", b["hcp_job_id"]) or None})
     return out
 
@@ -286,7 +288,7 @@ def build_job_detail(conn, job_id: str, settings: dict, now: datetime) -> Option
         "customer_name": job["customer_name"], "customer_phone": job["customer_phone"],
         "contact_phones": wd.get("contact_phones") or ([job["customer_phone"]] if job["customer_phone"] else []),
         "address": address_line(job), "lat": job["lat"], "lng": job["lng"], "geocode_status": job["geocode_status"],
-        "trade_code": job["trade_code"], "source_category": job["source_category"], "lead_source": job["lead_source"],
+        "trade_code": job["trade_code"], "type": classify_job(job, settings, w), "lead_source": job["lead_source"],
         "job_type": job["job_type"], "tags": job["tags"], "received_at": job["hcp_created_at"],
         "scheduled_start": job["scheduled_start"], "scheduled_end": job["scheduled_end"],
         "assigned": [{"id": i, "name": names.get(i, i)} for i in job["assigned_employee_ids"]],
@@ -411,10 +413,12 @@ def build_areas(conn, settings: dict, now: datetime, search_days: Optional[int] 
         w = wmap.get(jid)
         sc = score_job(job, w, settings, now, exceptions.get(jid))
         key, label = area_of(job, group_by)
-        a = areas.setdefault(key, {"key": key, "label": label, "count": 0, "by_trade": {}, "overdue": 0, "due_soon": 0,
+        a = areas.setdefault(key, {"key": key, "label": label, "count": 0, "by_type": {t: 0 for t in TYPE_LABELS},
+                                   "by_trade": {}, "overdue": 0, "due_soon": 0,
                                    "excused": 0, "unlocated": 0, "oldest_received_at": None, "_techs": {}})
         total += 1
         a["count"] += 1
+        a["by_type"][classify_job(job, settings, w)["label"]] += 1
         trade = job["trade_code"] or "other"
         a["by_trade"][trade] = a["by_trade"].get(trade, 0) + 1
         a["overdue"] += sc["deadline_status"] == "overdue"

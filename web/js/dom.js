@@ -134,7 +134,6 @@ export function timeAgo(iso) {
   if (s < 86400) return `${Math.round(s / 3600)} h ago`;
   return `${Math.round(s / 86400)} d ago`;
 }
-export const SOURCE_LABEL = { ahs: 'AHS', other_warranty: 'Other warranty', direct: 'Direct lead' };
 export const toast = (() => {
   let box;
   return (msg, kind = 'info', ms = 4000) => {

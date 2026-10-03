@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   job_type TEXT NOT NULL DEFAULT '',
   tags TEXT NOT NULL DEFAULT '[]',
   trade_code TEXT NOT NULL DEFAULT '',            -- canonical: PLB / HVAC / ELEC / APPL / ''
-  source_category TEXT NOT NULL DEFAULT 'direct', -- ahs | other_warranty | direct
+  source_category TEXT NOT NULL DEFAULT 'direct', -- legacy, no longer written or read: a job's type comes from its tags (domain/jobkind.py)
   description_raw TEXT NOT NULL DEFAULT '',
   description_hash TEXT NOT NULL DEFAULT '',
   hcp_created_at TEXT, hcp_updated_at TEXT, last_synced_at TEXT,

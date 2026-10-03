@@ -22,7 +22,7 @@ class BookingBase(unittest.TestCase):
                                  "VALUES ('dee@example.com', 'Dee', 'x', 'dispatcher', '2026-01-01T00:00:00Z')").lastrowid
             self.settings = get_settings(c)
             self.top = build_dispatch(c, TODAY, self.settings, NOW)["unscheduled"]
-        self.job = next(u["id"] for u in self.top if u["lat"] is not None)      # the Emergency plumbing call
+        self.job = self.e.water_leak_job()                                         # the water-leak plumbing call
 
     def tearDown(self):
         self.e.close()

@@ -97,14 +97,14 @@ export function mountSettings(root, ctx) {
       draft.deadline_rules = out;
     };
     const addRow = (co = '', pr = '', hrs = '') => {
-      const tr = h('tr', {}, h('td', {}, h('input', { type: 'text', value: co, placeholder: 'AHS', 'aria-label': 'Company', oninput: sync })),
+      const tr = h('tr', {}, h('td', {}, h('input', { type: 'text', value: co, placeholder: 'WARRANTY', 'aria-label': 'Group', oninput: sync })),
         h('td', {}, h('input', { type: 'text', value: pr, placeholder: 'Expedited', 'aria-label': 'Priority', oninput: sync })),
         h('td', {}, h('input', { type: 'number', min: 0.5, step: 0.5, value: hrs, 'aria-label': 'Hours', oninput: sync })),
         h('td', {}, h('button', { class: 'btn icon', type: 'button', 'aria-label': 'Remove row', onclick: () => { tr.remove(); sync(); } }, icon('x', 14))));
       body.append(tr);
     };
     rows.forEach((r) => addRow(...r));
-    return h('div', {}, h('table', { class: 'tbl edit' }, h('thead', {}, h('tr', {}, h('th', {}, 'Source'), h('th', {}, 'Priority'), h('th', {}, 'Hours to schedule'), h('th'))), body),
+    return h('div', {}, h('table', { class: 'tbl edit' }, h('thead', {}, h('tr', {}, h('th', {}, 'Group'), h('th', {}, 'Type'), h('th', {}, 'Hours to schedule'), h('th'))), body),
       h('button', { class: 'btn', type: 'button', onclick: () => addRow() }, icon('plus', 14), ' Add rule'));
   }
   function durationEditor() {
@@ -125,6 +125,8 @@ export function mountSettings(root, ctx) {
       h('button', { class: 'btn', type: 'button', onclick: () => { addRow(); sync(); } }, icon('plus', 14), ' Add duration'));
   }
   const list = (path, label, help) => field(label, h('textarea', { rows: 5, oninput: (e) => setPath(draft, path, e.target.value.split('\n').map((s) => s.trim().toLowerCase()).filter(Boolean)) }, (getPath(draft, path) || []).join('\n')), help);
+  const tagList = (path, label, help) => field(label, h('textarea', { rows: 3, oninput: (e) => setPath(draft, path, e.target.value.split('\n').map((x) => x.trim()).filter(Boolean)) },
+    (getPath(draft, path) || []).join('\n')), help);
   const aliases = () => field('Trade aliases (ALIAS = TRADE, one per line)', h('textarea', { rows: 6, oninput: (e) => {
     const m = {}; for (const line of e.target.value.split('\n')) { const [a, b] = line.split('='); if (a && b) m[a.trim().toUpperCase()] = b.trim().toUpperCase(); } draft.trade_aliases = m; } },
   Object.entries(draft.trade_aliases).map(([a, b]) => `${a} = ${b}`).join('\n')), 'Maps job types / warranty trade codes to the codes used for technician skills.');
@@ -143,14 +145,21 @@ export function mountSettings(root, ctx) {
       render(page, h('h1', {}, 'Settings'),
         h('form', { class: 'settings', onsubmit: save },
           sec('Deadline rules', h('div', { class: 'alert info' }, icon('clock', 14), ' Deadlines are targets, not hard limits. Normal warranty calls are 48 hours. A dispatcher can book a job later and record why (customer not available, etc.) on its job card; that job then stops counting as overdue.'),
-            note('Hours from when a job arrives in Housecall Pro until it should be scheduled. Source keys: AHS, OTHER_WARRANTY, DIRECT. Priorities: Emergency, Expedited, Normal. A priority with no row has no deadline clock and is ranked by its base score alone (AHS Emergency has none). The Expedited and Direct hours are still placeholders: confirm them against your vendor agreements.'), deadlineEditor()),
+            note('Hours from when a job arrives in Housecall Pro until it should be scheduled. Groups: WARRANTY (types Expedited, Normal, Recall) and RETAIL (type Retail). A type with no row has no deadline clock and is ranked by its base score alone. Normal warranty is 48 hours; the Expedited, Recall and Retail hours are still placeholders: confirm them against your vendor agreements.'), deadlineEditor()),
+          sec('Job types', h('div', { class: 'alert info' }, icon('alert', 14), ' Warranty work is Expedited, Normal or Recall. A job with none of these Housecall Pro tags is Retail: a warranty call that was turned into a retail job, or a lead from an ad.'),
+            h('div', { class: 'grid' },
+              tagList('job_types.warranty_tags.Expedited', 'Expedited warranty tags (one per line)'),
+              tagList('job_types.warranty_tags.Normal', 'Normal warranty tags (one per line)'),
+              tagList('job_types.warranty_tags.Recall', 'Recall warranty tags (one per line)'),
+              tagList('job_types.ad_lead_tags', 'Retail ad-lead tags (one per line)', 'A retail job with one of these tags (or this lead source) is marked as an ad lead.')),
+            note('Matching ignores capital letters and extra spaces, so “Normal : Expedited” matches “normal: expedited”. If a job has more than one warranty tag, the most urgent wins. A warranty call without a tag is shown as Retail.')),
           sec('Areas', h('div', { class: 'grid' }, field('Group calls by',
             h('select', { onchange: (e) => setPath(draft, 'areas.group_by', e.target.value) },
               [['city', 'City'], ['zip', 'ZIP code']].map(([v, t]) => h('option', { value: v, selected: getPath(draft, 'areas.group_by') === v }, t))),
             'Used for the running totals on the Dispatch > Areas tab and the "All areas" filter.'))),
           sec('Priority score', h('div', { class: 'grid' },
-            num('scoring.base_by_priority.Emergency', 'Base: Emergency'), num('scoring.base_by_priority.Expedited', 'Base: Expedited'), num('scoring.base_by_priority.Normal', 'Base: Normal'),
-            num('scoring.base_direct_lead', 'Base: direct lead'), num('scoring.base_other_warranty', 'Base: other warranty'),
+            num('scoring.base_by_priority.Expedited', 'Base: Expedited'), num('scoring.base_by_priority.Recall', 'Base: Recall'), num('scoring.base_by_priority.Normal', 'Base: Normal'),
+            num('scoring.base_retail', 'Base: Retail'),
             num('scoring.deadline_points.warning', 'Deadline <= 50% left'), num('scoring.deadline_points.critical', 'Deadline <= 25% left'), num('scoring.deadline_points.overdue', 'Deadline overdue'),
             num('scoring.urgency_points_each', 'Points per urgency keyword'), num('scoring.urgency_points_cap', 'Urgency cap'),
             num('scoring.age_points_per_day', 'Points per day waiting', { step: 0.5 }), num('scoring.age_points_cap', 'Age cap')),
@@ -160,15 +169,15 @@ export function mountSettings(root, ctx) {
             num('scheduling.default_duration_minutes', 'Default job minutes', { min: 5 }), num('scheduling.round_to_minutes', 'Round start times to (min)', { min: 1 }),
             num('scheduling.travel_speed_mph', 'Average drive speed (mph)', { min: 5 }), num('scheduling.travel_circuity', 'Road/straight-line factor', { step: 0.05, min: 1 }),
             num('scheduling.min_travel_minutes', 'Minimum drive (min)'), num('scheduling.same_day_lead_minutes', 'Same-day lead time (min)'),
-            num('scheduling.day_penalty_minutes.Emergency', 'Delay penalty / day: Emergency'), num('scheduling.day_penalty_minutes.Expedited', 'Delay penalty / day: Expedited'),
-            num('scheduling.day_penalty_minutes.Normal', 'Delay penalty / day: Normal'), num('scheduling.day_penalty_minutes.Direct', 'Delay penalty / day: Direct'),
+            num('scheduling.day_penalty_minutes.Expedited', 'Delay penalty / day: Expedited'), num('scheduling.day_penalty_minutes.Recall', 'Delay penalty / day: Recall'),
+            num('scheduling.day_penalty_minutes.Normal', 'Delay penalty / day: Normal'), num('scheduling.day_penalty_minutes.Retail', 'Delay penalty / day: Retail'),
             num('scheduling.deadline_miss_penalty', 'Penalty if past deadline')),
           h('div', { class: 'grid' },
             num('scheduling.window_minutes', 'Standard arrival window (minutes)', { min: 15, help: '240 = 4 hours. Dispatchers can change it for one job on its card.' }),
             num('scheduling.window_step_minutes', 'Windows start every (minutes)', { min: 5, help: '60 = on the hour: 8-12, 9-1, 10-2.' }),
             num('scheduling.stack_within_minutes', 'Offer the same window within (min drive)', { min: 0, help: 'A job this close to another is suggested into its window. 0 turns it off.' })),
           note('Customers are given an arrival window, not a time. Windows are allowed to overlap (job 1 8-12, job 2 10-2), which gives the technician slack when a job runs long.'),
-          note('The delay penalty is "minutes of extra driving you would accept to get the job done one day sooner". A high value for Emergency makes it prefer today.')),
+          note('The delay penalty is "minutes of extra driving you would accept to get the job done one day sooner". A high value for Expedited makes it prefer today.')),
           sec('Job durations', note('Longest matching keyword wins, then the trade default. Used for new jobs and for scheduled jobs that have no end time.'), durationEditor()),
           sec('Mapping & links', h('div', { class: 'grid' }, txt('timezone', 'Company timezone', 'IANA name, e.g. America/Phoenix'),
             txt('map.tile_url', 'Map tile URL', 'https only; {z}/{x}/{y}. Use a Mapbox/Google/Stadia style URL for production (OpenStreetMap’s public tiles are for light use).'),

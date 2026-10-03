@@ -9,6 +9,8 @@ its paces on the real jobs and technicians:
     keep (inside the window, inside the shift, a working day, right trade skill, under the daily maximum)
   * drive times: compares the straight-line estimate the slot finder uses with real road times (when a road
     router is configured) and suggests a speed setting if the estimate is off
+  * how the jobs were sorted into Expedited / Normal / Recall warranty work and Retail (from their tags), so a tag
+    spelled differently from the Settings is spotted straight away
   * pins that look misplaced (a long way from every technician)
 
 The report keeps counts, timings and ratios only: no customer names, addresses, phone numbers or job ids, so it is safe
@@ -23,9 +25,10 @@ from datetime import date, datetime, timezone
 from typing import Callable, List, Optional
 from zoneinfo import ZoneInfo
 
+from ..domain.jobkind import TYPE_LABELS, classify_job, count_types
 from ..domain.timeutil import hhmm_to_minutes
 from ..domain.travel import HaversineTravel, haversine_miles
-from .dispatch_view import build_areas, build_dispatch, compute_slots, load_technicians
+from .dispatch_view import build_areas, build_dispatch, compute_slots, job_dict, load_technicians
 from .settings_store import get_settings
 from .sync import SyncService
 
@@ -133,6 +136,31 @@ def run_live_check(db, cfg, hcp, geocoder, routes, now: Optional[datetime] = Non
                             "not reading (it reads the job description and any note that looks like a dispatch): run "
                             "python scripts/phase0_probe.py and share its report.")
 
+        # how every open job was typed, and which tags are in use (tag names stay on this screen, never in the report)
+        have_text = {r[0] for r in conn.execute("SELECT hcp_job_id FROM warranty_details")}
+        kinds, tag_counts = [], {}
+        for r in conn.execute("SELECT * FROM jobs WHERE active = 1 AND work_status != 'complete'"):
+            j = job_dict(r)
+            kinds.append(classify_job(j, settings, {"x": 1} if j["hcp_job_id"] in have_text else None))
+            for t in j["tags"]:
+                tag_counts[str(t)] = tag_counts.get(str(t), 0) + 1
+        by_type = count_types(kinds)
+        ads = sum(1 for k in kinds if k["ad_lead"])
+        untagged = sum(1 for k in kinds if k["warranty_text_without_tag"])
+        report["job_types"] = {**by_type, "retail_ad_leads": ads, "warranty_text_without_tag": untagged}
+        printer("  open jobs by type: " + ", ".join(f"{t} {by_type[t]}" for t in TYPE_LABELS) + (f" (of the Retail, {ads} ad lead(s))" if ads else ""))
+        if tag_counts:
+            printer("  tags on your jobs (this screen only): " + ", ".join(f"{t} x{n}" for t, n in sorted(tag_counts.items(), key=lambda kv: -kv[1])[:12]))
+        if kinds and not any(k["kind"] == "warranty" for k in kinds):
+            if untagged:
+                verdict("WARN", f"No job carries a warranty tag, yet {untagged} have warranty dispatch text, so every job shows as Retail. "
+                                "Compare the tags listed above with Admin > Settings > Job types and correct the tag names there.")
+            else:
+                verdict("INFO", "No job carries one of the warranty tags, so every job shows as Retail (right if you have no warranty work open).")
+        elif untagged:
+            verdict("INFO", f"{untagged} job(s) have warranty dispatch text but no warranty tag, so they show as Retail "
+                            "(right for a warranty call turned into a retail job; if one should be warranty work, tag it in Housecall Pro).")
+
         routable = [t for t in techs if t["active"] and t["trade_skills"] and t["home_lat"] is not None]
         need = [t for t in techs if t["active"] and not (t["trade_skills"] and t["home_lat"] is not None)]
         report["technicians"] = {"total": len(techs), "active": sum(t["active"] for t in techs), "routable": len(routable),
@@ -177,7 +205,7 @@ def run_live_check(db, cfg, hcp, geocoder, routes, now: Optional[datetime] = Non
                 if res["options"]:
                     with_options += 1
                     b = res["options"][0]
-                    printer(f"  job {i} ({u['priority_label']} {trade or 'any trade'}): {len(res['options'])} option(s); best {b['date']} "
+                    printer(f"  job {i} ({u['type_label']} {trade or 'any trade'}): {len(res['options'])} option(s); best {b['date']} "
                             f"window {b['window_start_min'] // 60:02d}:{b['window_start_min'] % 60:02d}-"
                             f"{b['window_end_min'] // 60:02d}:{b['window_end_min'] % 60:02d}, +{b['added_drive_min']:.0f} min driving ({ms} ms)")
                 else:
@@ -187,7 +215,7 @@ def run_live_check(db, cfg, hcp, geocoder, routes, now: Optional[datetime] = Non
                         reasons[x["reason"]] = reasons.get(x["reason"], 0) + 1
                     why = "; ".join(f"{r} ({n})" for r, n in sorted(here.items(), key=lambda kv: -kv[1])) \
                         or (res["notes"][0] if res["notes"] else "no technician can take it")
-                    printer(f"  job {i} ({u['priority_label']} {trade or 'any trade'}): no slot in {horizon} days ({ms} ms): {why}")
+                    printer(f"  job {i} ({u['type_label']} {trade or 'any trade'}): no slot in {horizon} days ({ms} ms): {why}")
             report["slots"].update({"jobs_tested": tested, "with_options": with_options, "rule_violations": len(broken),
                                     "no_slot_reasons": reasons, "ms_median": _median(times), "ms_max": max(times)})
             verdict("PASS" if with_options == tested else "WARN" if with_options else "FAIL",

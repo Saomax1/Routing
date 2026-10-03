@@ -3,9 +3,11 @@ Admin-editable settings (stored as one JSON document in the ``settings`` table),
 
 ``deadline_rules`` control the deadline warnings and the urgency points in the priority score. They are
 TARGETS, not hard limits: a dispatcher can waive a job's deadline and record why (see
-``services/job_exceptions.py``). A priority with no rule (AHS Emergency) simply has no deadline clock.
-Normal warranty calls are 48 h; the Expedited and Direct values are still placeholders - confirm them
-under Admin > Settings.
+``services/job_exceptions.py``). A type with no rule simply has no deadline clock. Normal warranty calls are
+48 h; the Expedited, Recall and Retail values are still placeholders - confirm them under Admin > Settings.
+
+Job types (``job_types``): warranty work is Expedited, Normal or Recall, told apart by three Housecall Pro tags;
+everything else is Retail (``domain/jobkind.py``). The tag texts are editable here.
 """
 
 from __future__ import annotations
@@ -16,15 +18,16 @@ from typing import Any
 from ..db import jdump, jload
 from ..domain.areas import GROUP_BY
 from ..domain.durations import DEFAULT_DURATIONS
+from ..domain.jobkind import DEFAULT_JOB_TYPES, validate_job_types
 
 SETTINGS_KEY = "app"
 
 DEFAULT_SETTINGS: dict = {
     "timezone": "America/Phoenix",
     "scoring": {
-        "base_by_priority": {"Emergency": 100, "Expedited": 60, "Normal": 20},
-        "base_direct_lead": 30,
-        "base_other_warranty": 20,
+        # Warranty work by type. Recall (a return visit to something already repaired) is a placeholder: confirm it.
+        "base_by_priority": {"Expedited": 60, "Recall": 40, "Normal": 20},
+        "base_retail": 30,
         "urgency_points_each": 10,
         "urgency_points_cap": 30,
         "age_points_per_day": 3,
@@ -32,12 +35,14 @@ DEFAULT_SETTINGS: dict = {
         "deadline_points": {"overdue": 40, "critical": 30, "warning": 15},
     },
     # Hours from "received" until the job should be scheduled/contacted. A target, not a hard limit (jobs can be
-    # given a "deadline waived" note). AHS Emergency has no rule on purpose. Expedited/Direct: confirm!
+    # given a "deadline waived" note). Normal warranty = 48 h; Expedited, Recall and Retail are placeholders: confirm!
     "deadline_rules": {
-        "AHS": {"Expedited": 24, "Normal": 48},
-        "OTHER_WARRANTY": {"Normal": 48},
-        "DIRECT": {"Normal": 24},
+        "WARRANTY": {"Expedited": 24, "Normal": 48, "Recall": 24},
+        "RETAIL": {"Retail": 24},
     },
+    # Which Housecall Pro tags make a job Expedited / Normal / Recall warranty work (anything else is Retail), and
+    # which tag marks a retail lead from an ad. Compared ignoring case and spacing.
+    "job_types": DEFAULT_JOB_TYPES,
     # How the running totals on the Areas tab group unscheduled calls: by "city" or by "zip" code.
     "areas": {"group_by": "city"},
     "urgency_keywords": ["secondary damage", "leak", "flood", "no water", "no hot water",
@@ -53,8 +58,8 @@ DEFAULT_SETTINGS: dict = {
         "top_n": 5,
         "default_duration_minutes": 60,
         "round_to_minutes": 5,
-        # Extra "cost" (in minutes of driving) per day of delay, by priority: Emergency jobs prefer today
-        "day_penalty_minutes": {"Emergency": 240, "Expedited": 90, "Normal": 15, "Direct": 10},
+        # Extra "cost" (in minutes of driving) per day of delay, by type: Expedited jobs prefer today
+        "day_penalty_minutes": {"Expedited": 90, "Recall": 60, "Normal": 15, "Retail": 10},
         "deadline_miss_penalty": 300,
         "travel_speed_mph": 28,
         "travel_circuity": 1.3,     # straight-line distance x this ~= road distance
@@ -128,6 +133,8 @@ def validate_settings(patch: dict) -> None:
             ZoneInfo(tz)
         except Exception:
             raise ValueError(f"Unknown timezone '{tz}'")
+    if "job_types" in patch:
+        validate_job_types(patch["job_types"])
     group_by = (patch.get("areas") or {}).get("group_by")
     if group_by is not None and group_by not in GROUP_BY:
         raise ValueError(f"Area grouping must be one of: {', '.join(GROUP_BY)}")
@@ -149,9 +156,41 @@ def validate_settings(patch: dict) -> None:
             raise ValueError(f"Trade alias '{alias}' must map to a trade code")
 
 
+def upgrade_stored(stored: dict) -> dict:
+    """Settings saved by earlier versions, brought up to date so the Settings page keeps working and the admin's numbers
+    survive. Earlier versions ranked warranty calls Emergency / Expedited / Normal by source (AHS, other warranty) and
+    called everything else a "direct lead"; there are now Expedited / Normal / Recall warranty calls and Retail."""
+    s = copy.deepcopy(stored or {})
+    sc = s.get("scoring")
+    if isinstance(sc, dict):
+        if "base_direct_lead" in sc:
+            sc.setdefault("base_retail", sc["base_direct_lead"])
+        for old in ("base_direct_lead", "base_other_warranty"):
+            sc.pop(old, None)
+        if isinstance(sc.get("base_by_priority"), dict):
+            sc["base_by_priority"].pop("Emergency", None)
+    pen = (s.get("scheduling") or {}).get("day_penalty_minutes")
+    if isinstance(pen, dict):
+        if "Direct" in pen:
+            pen.setdefault("Retail", pen["Direct"])
+        pen.pop("Direct", None)
+        pen.pop("Emergency", None)
+    rules = s.get("deadline_rules")
+    if isinstance(rules, dict) and ({"AHS", "OTHER_WARRANTY", "DIRECT"} & set(rules)) and not ({"WARRANTY", "RETAIL"} & set(rules)):
+        warranty = {}
+        for company in ("AHS", "OTHER_WARRANTY"):
+            for prio, hours in (rules.get(company) or {}).items():
+                if prio in ("Expedited", "Normal", "Recall"):
+                    warranty.setdefault(prio, hours)
+        direct = (rules.get("DIRECT") or {}).get("Normal")
+        s["deadline_rules"] = deep_merge(DEFAULT_SETTINGS["deadline_rules"],
+                                         {"WARRANTY": warranty, "RETAIL": {"Retail": direct} if direct else {}})
+    return s
+
+
 def get_settings(conn) -> dict:
     row = conn.execute("SELECT value FROM settings WHERE key = ?", (SETTINGS_KEY,)).fetchone()
-    stored = jload(row["value"], {}) if row else {}
+    stored = upgrade_stored(jload(row["value"], {}) if row else {})
     merged = deep_merge(DEFAULT_SETTINGS, stored)
     for key in FREE_FORM_MAPS:
         if key in stored:
@@ -167,6 +206,7 @@ def save_settings(conn, patch: dict) -> dict:
     for key in FREE_FORM_MAPS:
         if key in patch:
             merged[key] = patch[key]
+    validate_job_types(merged["job_types"])          # e.g. one tag under two types, checked across old and new values
     conn.execute("INSERT INTO settings(key, value) VALUES(?, ?) "
                  "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (SETTINGS_KEY, jdump(merged)))
     return merged

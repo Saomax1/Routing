@@ -113,7 +113,7 @@ class AuthTests(ApiBase):
 
     def test_dispatcher_cannot_do_admin_things(self):
         d = self.disp
-        self.assertEqual(d.put("/api/settings", {"settings": {"scoring": {"base_direct_lead": 1}}}).status, 403)
+        self.assertEqual(d.put("/api/settings", {"settings": {"scoring": {"base_retail": 1}}}).status, 403)
         self.assertEqual(d.put("/api/technicians/emp_demo_1", {"active": False}).status, 403)
         self.assertEqual(d.get("/api/users").status, 403)
         self.assertEqual(d.post("/api/users", {"email": "x@y.zz", "password": "long-enough-pw", "role": "admin"}).status, 403)
@@ -131,7 +131,7 @@ class DispatchApiTests(ApiBase):
         self.assertEqual(r.status, 200)
         d = r.json()
         self.assertTrue(len(d["unscheduled"]) >= 10)
-        self.assertEqual(d["unscheduled"][0]["priority_label"], "Emergency")
+        self.assertEqual(d["unscheduled"][0]["type_label"], "Expedited")
         self.assertIn("technicians", d)
         self.assertEqual(self.disp.get(f"/api/dispatch?date={d['today']}").status, 200)
         self.assertEqual(self.disp.get("/api/dispatch?date=1999-01-01").status, 400)
@@ -462,7 +462,7 @@ class AreasApiTests(ApiBase):
     def test_removed_deadline_rules_stay_removed(self):
         before = self.admin.get("/api/settings").json()["settings"]["deadline_rules"]
         try:
-            slim = {"AHS": {"Normal": 48}}
+            slim = {"WARRANTY": {"Normal": 48}}
             self.assertEqual(self.admin.put("/api/settings", {"settings": {"deadline_rules": slim}}).status, 200)
             self.assertEqual(self.admin.get("/api/settings").json()["settings"]["deadline_rules"], slim)
         finally:
@@ -496,15 +496,15 @@ class AdminApiTests(ApiBase):
 
     def test_settings_update(self):
         a = self.admin
-        r = a.put("/api/settings", {"settings": {"scoring": {"base_direct_lead": 33}}, "durations":
+        r = a.put("/api/settings", {"settings": {"scoring": {"base_retail": 33}}, "durations":
                                     [{"trade_code": "PLB", "keyword": "", "minutes": 50}]})
         self.assertEqual(r.status, 200)
-        self.assertEqual(r.json()["settings"]["scoring"]["base_direct_lead"], 33)
+        self.assertEqual(r.json()["settings"]["scoring"]["base_retail"], 33)
         self.assertEqual(r.json()["durations"], [{"trade_code": "PLB", "keyword": "", "minutes": 50}])
-        self.assertEqual(a.put("/api/settings", {"settings": {"scoring": {"base_direct_lead": "x"}}}).status, 400)
+        self.assertEqual(a.put("/api/settings", {"settings": {"scoring": {"base_retail": "x"}}}).status, 400)
         self.assertEqual(a.put("/api/settings", {}).status, 400)
-        self.assertEqual(self.disp.get("/api/settings").json()["settings"]["scoring"]["base_direct_lead"], 33)
-        a.put("/api/settings", {"settings": {"scoring": {"base_direct_lead": 30}}, "durations": [
+        self.assertEqual(self.disp.get("/api/settings").json()["settings"]["scoring"]["base_retail"], 33)
+        a.put("/api/settings", {"settings": {"scoring": {"base_retail": 30}}, "durations": [
             {"trade_code": "*", "keyword": "", "minutes": 60}, {"trade_code": "PLB", "keyword": "", "minutes": 60},
             {"trade_code": "HVAC", "keyword": "", "minutes": 75}]})
 

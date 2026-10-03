@@ -89,22 +89,6 @@ def guess_trade_from_text(text: str) -> str:
     return ""
 
 
-_OTHER_WARRANTY_HINTS = ["warranty", "first american", "choice home", "hwa", "fidelity national", "old republic",
-                         "2-10", "select home", "liberty home guard", "cinch", "frontdoor", "total home protection"]
-
-
-def classify_source(lead_source: str, tags: list, warranty_company: Optional[str]) -> str:
-    """ahs | other_warranty | direct"""
-    if warranty_company:
-        return "ahs" if warranty_company.upper() in ("AHS", "FRONTDOOR") else "other_warranty"
-    hay = " ".join([lead_source or ""] + [str(t) for t in tags]).lower()
-    if re.search(r"\bahs\b|american home shield|frontdoor", hay):
-        return "ahs"
-    if any(h in hay for h in _OTHER_WARRANTY_HINTS):
-        return "other_warranty"
-    return "direct"
-
-
 # Where a job's private notes may be: a list of {content|text|note|body}, a list of strings, or one string.
 NOTE_KEYS = ("notes", "private_notes", "internal_notes", "job_notes")
 _NOTE_TEXT_KEYS = ("content", "text", "note", "body")

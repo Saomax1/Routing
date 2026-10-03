@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 from app.hcp.client import HCPClient, MockHCPClient
 from app.hcp.fixtures import DEMO_TECH_SETUP, build_ahs_description
 from app.hcp.http import HttpError
-from app.hcp.normalize import canonical_work_status, classify_source, normalize_employee, normalize_job
+from app.hcp.normalize import canonical_work_status, normalize_employee, normalize_job
 from app.services import ai_fallback
 from app.services.dispatch_view import build_areas, build_dispatch, build_job_detail, compute_slots, load_technicians
 from app.services.job_exceptions import clear_exception, exception_map, set_exception
@@ -45,6 +45,10 @@ class Env:
         with self.db.session() as c:
             return [dict(r) for r in c.execute(sql, args).fetchall()]
 
+    def water_leak_job(self):
+        """The demo's Chandler water-leak call: its dispatch text says Emergency, its tag makes it Expedited."""
+        return self.q("SELECT hcp_job_id FROM warranty_details WHERE dispatch_priority = 'Emergency'")[0]["hcp_job_id"]
+
 
 class SyncTests(unittest.TestCase):
     def setUp(self):
@@ -69,20 +73,19 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(techs["emp_demo_5"]["active"], 0)             # inactive in HCP
 
     def test_warranty_parsing_and_classification(self):
-        rows = {r["hcp_job_id"]: r for r in self.e.q("SELECT * FROM jobs")}
         w = {r["hcp_job_id"]: r for r in self.e.q("SELECT * FROM warranty_details")}
         by_prio = {}
         for jid, wr in w.items():
             by_prio.setdefault(wr["dispatch_priority"], []).append(jid)
-        self.assertIn("Emergency", by_prio)
+        self.assertIn("Emergency", by_prio)                              # the dispatch text still says what it says
         self.assertIn("Expedited", by_prio)
-        ahs = [j for j in rows.values() if j["source_category"] == "ahs"]
-        self.assertTrue(len(ahs) >= 10)
-        other = [j for j in rows.values() if j["source_category"] == "other_warranty"]
-        self.assertEqual(len(other), 1)                                  # "Choice Home Warranty" job
-        self.assertNotIn(other[0]["hcp_job_id"], w)                      # not AHS format -> no warranty_details
-        direct = [j for j in rows.values() if j["source_category"] == "direct"]
-        self.assertTrue(any(j["lead_source"] == "Google LSA" for j in direct))
+        self.assertEqual(len(self.e.q("SELECT 1 FROM jobs WHERE hcp_job_id LIKE 'job_demo_%' AND lead_source = 'Choice Home Warranty'")), 1)
+        with self.e.db.session() as c:                                   # ...but a job's TYPE comes from its tags
+            u = build_dispatch(c, date(2026, 10, 1), get_settings(c), NOW)["unscheduled"]
+        self.assertEqual({t: sum(1 for x in u if x["type_label"] == t) for t in ("Expedited", "Normal", "Recall", "Retail")},
+                         {"Expedited": 3, "Normal": 4, "Recall": 1, "Retail": 4})
+        self.assertEqual(sum(x["ad_lead"] for x in u), 1)
+        self.assertTrue(all(x["kind"] == ("retail" if x["type_label"] == "Retail" else "warranty") for x in u))
 
     def test_trades_resolved(self):
         rows = self.e.q("SELECT trade_code, COUNT(*) n FROM jobs GROUP BY trade_code")
@@ -165,12 +168,11 @@ class DispatchViewTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.e.close()
 
-    def test_unscheduled_sorted_by_score_emergency_first(self):
+    def test_unscheduled_sorted_by_score_expedited_first(self):
         u = self.view["unscheduled"]
         scores = [x["score"] for x in u]
         self.assertEqual(scores, sorted(scores, reverse=True))
-        self.assertEqual(u[0]["priority_label"], "Emergency")
-        self.assertEqual(u[0]["deadline_status"], "none")        # Emergency has no deadline clock
+        self.assertEqual(u[0]["type_label"], "Expedited")
 
     def test_tech_routes_have_ordered_stops(self):
         techs = {t["id"]: t for t in self.view["technicians"]}
@@ -194,18 +196,19 @@ class DispatchViewTests(unittest.TestCase):
 
     def test_job_detail(self):
         with self.e.db.session() as c:
-            top = self.view["unscheduled"][0]["id"]
+            top = c.execute("SELECT hcp_job_id FROM warranty_details WHERE dispatch_priority = 'Emergency'").fetchone()[0]
             d = build_job_detail(c, top, self.settings, NOW)
             self.assertEqual(d["warranty"]["dispatch_priority"], "Emergency")
+            self.assertEqual((d["type"]["kind"], d["type"]["label"]), ("warranty", "Expedited"))     # its tag, not its text, decides
             self.assertTrue(d["warranty"]["do_not_collect_service_fee"])
             self.assertTrue(d["contact_phones"])
             self.assertTrue(d["score"]["breakdown"])
             self.assertTrue(d["warranty"]["authorization_link"].startswith("https://"))
             self.assertIsNone(build_job_detail(c, "nope", self.settings, NOW))
 
-    def test_slots_for_emergency_plumbing_job(self):
+    def test_slots_for_the_water_leak_plumbing_job(self):
         with self.e.db.session() as c:
-            top = self.view["unscheduled"][0]["id"]
+            top = self.e.water_leak_job()
             res = compute_slots(c, top, self.settings, NOW)
         self.assertTrue(res["options"], res)
         self.assertTrue(res["duration_min"] >= 60)
@@ -255,7 +258,7 @@ class ExceptionTests(unittest.TestCase):
 
     def test_marking_a_job_excuses_it_and_it_survives_a_resync(self):
         before = self.view()
-        job = next(u for u in before["unscheduled"] if u["deadline_status"] == "overdue" and u["priority_label"] == "Normal")
+        job = next(u for u in before["unscheduled"] if u["deadline_status"] == "overdue" and u["type_label"] == "Normal")
         with self.e.db.session() as c:
             exc = set_exception(c, job["id"], "customer_unavailable", "  back   Monday ", None)
         self.assertEqual((exc["reason_label"], exc["note"]), ("Customer not available", "back Monday"))
@@ -599,7 +602,7 @@ class CompletedJobsViewTests(unittest.TestCase):
 
     def test_slots_start_from_the_last_completed_job_and_count_it(self):
         with self.e.db.session() as c:
-            top = self.view["unscheduled"][0]["id"]
+            top = self.e.water_leak_job()
             res = compute_slots(c, top, self.settings, self.LATE, 1)
         kinds = {o["tech_id"]: o["origin"]["kind"] for o in res["options"]}
         self.assertIn("complete", set(kinds.values()))                              # someone has already worked today
@@ -609,7 +612,7 @@ class CompletedJobsViewTests(unittest.TestCase):
 
     def test_a_window_can_be_chosen_per_search(self):
         with self.e.db.session() as c:
-            top = self.view["unscheduled"][0]["id"]
+            top = self.e.water_leak_job()
             default = compute_slots(c, top, self.settings, self.LATE, 3)
             short = compute_slots(c, top, self.settings, self.LATE, 3, 120)
             self.assertEqual(default["window_minutes"], 240)
@@ -636,15 +639,15 @@ class SettingsTests(unittest.TestCase):
         e = Env()
         try:
             with e.db.session() as c:
-                s = save_settings(c, {"scoring": {"base_direct_lead": 44}, "deadline_rules": {"AHS": {"Normal": 48}}})
-                self.assertEqual(s["scoring"]["base_direct_lead"], 44)
-                self.assertEqual(s["scoring"]["base_by_priority"]["Emergency"], 100)   # untouched
-                self.assertEqual(s["deadline_rules"], {"AHS": {"Normal": 48}})          # free-form map replaced
+                s = save_settings(c, {"scoring": {"base_retail": 44}, "deadline_rules": {"WARRANTY": {"Normal": 48}}})
+                self.assertEqual(s["scoring"]["base_retail"], 44)
+                self.assertEqual(s["scoring"]["base_by_priority"]["Expedited"], 60)    # untouched
+                self.assertEqual(s["deadline_rules"], {"WARRANTY": {"Normal": 48}})     # free-form map replaced
                 # ...and it stays replaced on the next read: removed rules must not reappear from the defaults
-                self.assertEqual(get_settings(c)["deadline_rules"], {"AHS": {"Normal": 48}})
-                self.assertEqual(get_settings(c)["scoring"]["base_direct_lead"], 44)
+                self.assertEqual(get_settings(c)["deadline_rules"], {"WARRANTY": {"Normal": 48}})
+                self.assertEqual(get_settings(c)["scoring"]["base_retail"], 44)
                 with self.assertRaises(ValueError):
-                    save_settings(c, {"scoring": {"base_direct_lead": "lots"}})
+                    save_settings(c, {"scoring": {"base_retail": "lots"}})
                 d = replace_durations(c, [{"trade_code": "plb", "keyword": "Water Heater", "minutes": 150}])
                 self.assertEqual(d, [{"trade_code": "PLB", "keyword": "water heater", "minutes": 150}])
                 with self.assertRaises(ValueError):
@@ -786,13 +789,10 @@ class NormalizeTests(unittest.TestCase):
         for raw in ({}, {"id": "x", "address": "123 Main", "customer": None, "schedule": "soon", "tags": None}):
             self.assertIsInstance(normalize_job(raw), dict)
 
-    def test_status_and_source_helpers(self):
+    def test_status_and_employee_helpers(self):
         self.assertEqual(canonical_work_status("in progress"), "in_progress")
         self.assertEqual(canonical_work_status("complete rated"), "complete")
         self.assertEqual(canonical_work_status("pro canceled"), "canceled")
-        self.assertEqual(classify_source("", ["AHS"], None), "ahs")
-        self.assertEqual(classify_source("Choice Home Warranty", [], None), "other_warranty")
-        self.assertEqual(classify_source("Google LSA", ["lead"], None), "direct")
         self.assertEqual(normalize_employee({"id": "e", "first_name": "A", "last_name": "B"})["name"], "A B")
 
 

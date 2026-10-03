@@ -3,14 +3,14 @@ import copy
 import importlib.util
 import json
 import unittest
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from app.domain.warranty_parser import looks_like_warranty, parse_warranty_job
 from app.hcp.client import HCPClient
 from app.hcp.fixtures import build_ahs_description
 from app.hcp.normalize import normalize_job, note_texts, warranty_notes
-from app.services.dispatch_view import build_job_detail
+from app.services.dispatch_view import build_dispatch, build_job_detail
 from app.services.live_check import run_live_check
 from app.services.geocode import MockGeocoder
 from app.services.routing import RoadRoutes
@@ -124,9 +124,13 @@ class PrivateNotesEndToEndTests(unittest.TestCase):
         before, after = self.parsed(self.base), self.parsed(self.notes)
         self.assertGreater(len(before), 20)
         self.assertEqual(after, before)
-        for env in (self.base, self.notes):
-            self.assertEqual(env.q("SELECT COUNT(*) AS n FROM jobs WHERE source_category = 'ahs'")[0]["n"],
-                             self.base.q("SELECT COUNT(*) AS n FROM jobs WHERE source_category = 'ahs'")[0]["n"])
+        types = {}
+        for name, env in (("base", self.base), ("notes", self.notes)):
+            with env.db.session() as c:
+                u = build_dispatch(c, date(2026, 10, 1), get_settings(c), NOW)["unscheduled"]
+            types[name] = sorted((x["id"], x["type_label"]) for x in u)
+        self.assertEqual(types["notes"], types["base"])                  # the tags are untouched, so the types are too
+        self.assertIn("Expedited", {t for _, t in types["notes"]})
 
     def test_private_remarks_never_reach_the_database_or_the_job_card(self):
         self.notes.live_sync()

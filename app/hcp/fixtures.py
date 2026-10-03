@@ -210,7 +210,7 @@ def make_demo_dataset(now: Optional[datetime] = None, tz_name: str = "America/Ph
                         items=[{"name": rng.choice(["Water Heater", "Faucet", "Toilet"]) if trade == "PLB"
                                 else rng.choice(["Cooling", "Thermostat"]), "problem": "Not Working"}],
                         total=100, svc_req=str(21000000 + jid))
-                    lead, tags = "AHS", ["warranty", "ahs"]
+                    lead, tags = "AHS", ["warranty", "ahs", "Normal: Normal"]
                 else:
                     desc = rng.choice(descriptions[trade])
                     lead, tags = rng.choice(["Google LSA", "Referral", "Repeat customer"]), []
@@ -234,8 +234,11 @@ def make_demo_dataset(now: Optional[datetime] = None, tz_name: str = "America/Ph
                 })
 
     # ---- unscheduled jobs (the interesting ones)
+    # How warranty work is tagged in Housecall Pro: three tags, one per type
+    tier_tags = {"Expedited": "Normal: Expedited", "Normal": "Normal: Normal", "Recall": "Normal: Recall"}
+
     def unscheduled(city, trade, priority, items, hours_ago, *, lead="AHS", tags=None, name=None,
-                    header_code="NORMAL", include_address=True, plain_desc=None, job_type=None):
+                    header_code="NORMAL", include_address=True, plain_desc=None, job_type=None, tier=None):
         zip_code = rng.choice(CITY_CENTERS[city][2])
         street = _street(rng)
         job_id = next_id()
@@ -255,7 +258,8 @@ def make_demo_dataset(now: Optional[datetime] = None, tz_name: str = "America/Ph
             "customer": {"first_name": first.title(), "last_name": last.title(), "mobile_number": f"480555{(300 + jid) % 1000:04d}"[:10]},
             "address": address_for(city, street, zip_code) if include_address else {},
             "schedule": {}, "assigned_employees": [],
-            "tags": tags if tags is not None else (["warranty", "ahs"] if lead == "AHS" else []),
+            "tags": tags if tags is not None else (["warranty", "ahs", tier_tags[tier or ("Expedited" if priority == "Emergency" else priority)]]
+                                                   if lead == "AHS" else []),
             "lead_source": lead,
             "job_fields": {"job_type": {"name": job_type or ("Plumbing" if trade == "PLB" else "HVAC")}},
             "created_at": _iso(created), "updated_at": _iso(created),
@@ -268,15 +272,17 @@ def make_demo_dataset(now: Optional[datetime] = None, tz_name: str = "America/Ph
     unscheduled("San Tan Valley", "HVAC", "Normal", [{"name": "Cooling", "problem": "No cooling"}], 18)
     unscheduled("Chandler", "HVAC", "Expedited", [{"name": "Cooling", "problem": "No cooling, elderly resident"}], 10)
     unscheduled("Gilbert", "PLB", "Normal", [{"name": "Faucet", "problem": "Dripping", "area": "Kitchen"},
-                                             {"name": "Toilet", "problem": "Running constantly", "area": "Master Bath"}], 26)
+                                             {"name": "Toilet", "problem": "Running constantly", "area": "Master Bath"}], 26,
+                tier="Recall")                                                    # a return visit to something repaired before
     unscheduled("Mesa", "PLB", "Normal", [{"name": "Stoppage", "problem": "Not Working"}], 6, include_address=False)
 
     unscheduled("Chandler", "PLB", "Normal", [], 1, lead="Google LSA", tags=["lead"],
                 plain_desc="Customer wants a quote for a tankless water heater install.", job_type="Plumbing")
-    unscheduled("Queen Creek", "HVAC", "Normal", [], 0.5, lead="Yelp", tags=["lead"],
+    unscheduled("Queen Creek", "HVAC", "Normal", [], 0.5, lead="Meta", tags=["lead", "Meta Lead"],      # an ad lead
                 plain_desc="AC is running but not blowing cold air.", job_type="HVAC")
     unscheduled("Mesa", "PLB", "Normal", [], 48, lead="Referral", tags=["lead"],
                 plain_desc="Replace garbage disposal.", job_type="Plumbing")
+    # a warranty call turned into a retail job: it still carries the old dispatch text but no warranty tag
     unscheduled("Mesa", "PLB", "Normal", [], 30, lead="Choice Home Warranty", tags=["warranty"],
                 plain_desc="Choice Home Warranty authorization #CHW-555-0101. Toilet leaking at base. Collect $85 trade fee.",
                 job_type="Plumbing")

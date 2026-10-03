@@ -30,8 +30,7 @@ from ..config import Config
 from ..db import Database, jdump, jload, utcnow_iso
 from ..domain.timeutil import at_local_minutes, to_iso
 from ..domain.warranty_parser import looks_like_warranty, missing_key_fields, parse_warranty_job
-from ..hcp.normalize import (canonical_trade, classify_source, guess_trade_from_text, normalize_employee,
-                             normalize_job)
+from ..hcp.normalize import canonical_trade, guess_trade_from_text, normalize_employee, normalize_job
 from .ai_fallback import ai_fill
 from .bookings import drop_stale
 from .data_mode import has_real_data, purge_demo_data
@@ -222,11 +221,9 @@ class SyncService:
                 wdata, parsed_by, warnings = jload(wrow["data"], {}), wrow["parsed_by"], jload(wrow["parse_warnings"], [])
 
         aliases = settings["trade_aliases"]
-        company = (wdata or {}).get("warranty_company") if (wdata and wdata.get("is_warranty")) else None
         trade = (canonical_trade((wdata or {}).get("trade_code") or "", aliases)
                  or canonical_trade(n["job_type"], aliases)
                  or guess_trade_from_text(desc[:800]))
-        category = classify_source(n["lead_source"], n["tags"], company)
 
         # --- address: the warranty "Covered Property Address" wins (it is the address to geocode)
         street, city, state, zip_code = n["street"], n["city"], n["state"], n["zip"]
@@ -259,7 +256,7 @@ class SyncService:
             "street": street, "city": city, "state": state, "zip": zip_code,
             "lat": lat, "lng": lng, "geocode_status": geo_status,
             "lead_source": n["lead_source"], "job_type": n["job_type"], "tags": jdump(n["tags"]),
-            "trade_code": trade, "source_category": category,
+            "trade_code": trade,
             "description_raw": desc, "description_hash": dhash,
             "hcp_created_at": n["hcp_created_at"], "hcp_updated_at": n["hcp_updated_at"],
             "last_synced_at": utcnow_iso(),
@@ -267,7 +264,7 @@ class SyncService:
         compare = ("work_status", "active", "scheduled_start", "scheduled_end", "arrival_window_minutes",
                    "completed_at", "assigned_employee_ids", "street", "city",
                    "zip", "lat", "lng", "lead_source", "tags", "description_hash", "hcp_updated_at", "trade_code",
-                   "source_category", "customer_name")
+                   "customer_name")
         changed = existing is None or any(existing[k] != row[k] for k in compare)
 
         cols = list(row)

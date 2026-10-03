@@ -89,8 +89,8 @@ Then:
    dry-runs the parser on real descriptions with names and phone numbers redacted. Fix `app/hcp/client.py` (auth scheme,
    paths, parameters) or `app/hcp/normalize.py` (field names); everything HCP-specific is isolated there and in
    `app/hcp/http.py`.
-5. **Confirm the deadline rules** under *Admin > Settings*: Normal is 48 h and AHS Emergency has no clock; the Expedited and
-   Direct hours are still placeholders (see below).
+5. **Check the job types and deadline rules** under *Admin > Settings*: the three warranty tag names (*Job types*), and the
+   hours and scores for Expedited, Normal, Recall and Retail. Normal is 48 h; the others are placeholders (see below).
 
 **Demo data and real data never mix.** Demo rows are recognised only by their ids (`job_demo_*`, `emp_demo_*`, which
 Housecall Pro never uses). In live mode the app deletes them at every start and sync (and the caches built from the fake
@@ -129,19 +129,31 @@ See [`.env.example`](.env.example) for the full annotated list. The important on
   This is still read-only: it is the same `GET /jobs` as before. Whether Housecall Pro includes private notes in the job list
   for your key is up to Housecall Pro: `python scripts/phase0_probe.py` (step 4) tells you how many of your jobs came back
   with notes and where the dispatch text was found, and `scripts/live_check.py` warns if no warranty text is found at all.
+- **Job types** (`app/domain/jobkind.py`): every job is exactly one of **Expedited**, **Normal**, **Recall** (warranty work) or
+  **Retail**, decided in one place from its Housecall Pro tags. Warranty work carries one of three tags (`normal: expedited`,
+  `normal: normal`, `normal: recall`); matching ignores capitals and spacing around the colon, and the tag names are editable
+  under *Admin > Settings > Job types*. **A job without one of those tags is Retail**: a call that did not come from a warranty
+  company, which means either a warranty call that was turned into a retail job or a lead from an ad. Ad leads are told apart
+  by the `meta lead` tag (also editable): they are Retail, marked *Ad lead* on the job card. If a job has more than one warranty
+  tag the most urgent wins. The warranty *text* does not decide the type: a converted job usually still carries its old dispatch
+  text, so it is shown as Retail (with a note on the card that the text is there), and its "do not collect the fee" alerts are
+  not shown. `live_check.py` and the probe show how your jobs sort and tell you if none match a warranty tag, so a tag spelled
+  differently from the Settings is caught quickly. The type is worked out when a job is read, so changing the tag names
+  applies at once.
 - **Warranty parser** (`app/domain/warranty_parser.py`): reads AHS / Frontdoor descriptions into dispatch priority, trade,
-  items, authorization limits, address and contact. Priority comes from the `Dispatch Priority:` line in the body, not the
-  header. Anything the regex cannot read is flagged in *Parse review*, where a dispatcher can fix it and mark it reviewed.
-- **Scoring** (`app/domain/scoring.py`): urgency = base by priority + points as the deadline approaches + urgency
-  keywords + age. Every score shows its breakdown in the job card.
-- **Deadlines are targets, not hard limits.** Normal warranty calls have a 48 h window; AHS Emergency has no deadline
-  clock (it is ranked by its base score alone). When a customer is not available, or there is any other reason to book
+  items, authorization limits, address and contact. The `Dispatch Priority:` line in the body is shown on the job card but no
+  longer sets the type (the tag does). Anything the regex cannot read is flagged in *Parse review*, where a dispatcher can fix it and mark it reviewed.
+- **Scoring** (`app/domain/scoring.py`): urgency = base by type (Expedited, Recall, Normal, Retail) + points as the deadline
+  approaches + urgency keywords + age. Every score shows its breakdown in the job card. It only orders the queue; the list does
+  not show it.
+- **Deadlines are targets, not hard limits.** Normal warranty calls have a 48 h window (Expedited, Recall and Retail have
+  placeholder windows: see Known gaps). When a customer is not available, or there is any other reason to book
   later, a dispatcher opens the job card, chooses *Booking this past its deadline?*, picks a reason and optionally
   adds a note. That job then shows *deadline waived* instead of overdue, earns no deadline points and is no longer
   penalized by the slot finder. It is saved in this app only (never written to Housecall Pro), records who marked it,
   and survives syncs. *Remove* puts the job back on the normal deadline.
 - **Areas** (`Dispatch > Areas` tab, `GET /api/areas`): a running total of unscheduled calls per area (city by default,
-  or ZIP under *Admin > Settings > Areas*), with overdue / due-soon / trade counts and the soonest technician openings
+  or ZIP under *Admin > Settings > Areas*), with how many calls of each type and the soonest technician openings
   in each area for the next 1-14 days, so you can see where it pays to send someone first. Each call is checked on its
   own against skills, shifts and existing routes, so openings are a guide, not a booking plan (calls share the same
   technicians). Click an area to filter the queue and map to it; the queue's *All areas* filter shows the same totals.
@@ -157,7 +169,7 @@ See [`.env.example`](.env.example) for the full annotated list. The important on
   reached inside its own window, driving and working straight through, and the day ends inside the shift. A stop that
   is already late by our (estimated) travel times is tolerated at the arrival it already has: inserting a job may never
   make it later. It also checks skills, work days, max jobs (finished jobs count) and same-day lead time, and ranks by
-  added drive time plus a per-day delay penalty (so Emergency jobs prefer today) plus a penalty for finishing after the
+  added drive time plus a per-day delay penalty (so Expedited jobs prefer today) plus a penalty for finishing after the
   deadline (skipped for jobs whose deadline is waived). Each option shows the window to book, the planned arrival
   ("arrive about 9:30"), and - if a nearby job (within *Offer the same window within*, 20 min of driving by default) has
   a window holding that arrival - the same window start, with a note like "same window as Jane (12 min away)"; windows
@@ -184,8 +196,12 @@ See [`.env.example`](.env.example) for the full annotated list. The important on
   maximum and today's route continues from the last finished job. A job under way (`in progress`) keeps its technician
   busy until it ends. If the completed-jobs call fails (the HCP status names are unverified) the rest of the sync still
   runs and the run is noted as partial; finished jobs are never hidden because of it.
-- **Map**: a small built-in slippy map. Pin shape = source (square AHS, diamond other warranty, circle direct), color =
-  priority, ring = deadline status. The tile source is `map.tile_url` in Settings (OpenStreetMap by default).
+- **Dispatch screen** (left list and map): the list shows one plain row per unscheduled call: its type (Expedited, Normal,
+  Recall or Retail), the customer and the address, with a filter for type and one for area. Everything else (trade, deadline,
+  score, warranty details, ad-lead mark, slot finder) is on the job card, which opens when a row is clicked. Every unscheduled
+  call is the same **red "!"** on the map, and no other colour is used for it: colour only appears once a job is on a technician's
+  route, in that technician's colour.
+- **Map**: a small built-in slippy map. The tile source is `map.tile_url` in Settings (OpenStreetMap by default).
   Tile requests send the site's address (no path) as the `Referer`, which OpenStreetMap requires; without it OSM
   answers "403 Access blocked". OSM's free servers are for light use only, so for daily team use pick a commercial
   tile provider (Stadia, MapTiler, Mapbox...) and paste its URL into `map.tile_url`.
@@ -222,10 +238,9 @@ See [`.env.example`](.env.example) for the full annotated list. The important on
 
 ## Known gaps
 
-- **Some deadline rules are still placeholders.** Normal warranty calls are 48 h and AHS Emergency has no clock, but
-  Expedited (24 h) and direct jobs (24 h) are guesses: confirm them under *Admin > Settings*. With no clock, an AHS
-  Emergency no longer picks up deadline points, so an overdue Expedited job can tie with a fresh Emergency in the
-  queue. Raise *Base: Emergency* under *Priority score* if you want Emergency to stay on top.
+- **Some deadline rules and scores are still placeholders.** Normal warranty calls are 48 h. Expedited (24 h), Recall (24 h,
+  base score 40, delay penalty 60) and Retail (24 h) are guesses: confirm them under *Admin > Settings*. There is no longer an
+  Emergency type: warranty work is Expedited, Normal or Recall, as tagged in Housecall Pro.
 - **The slot finder and Areas tab still use straight-line (Haversine) travel estimates.** Map lines and their hover
   times use real roads, but ranking does not yet. Using road times there needs a distance-matrix call (OSRM `table`,
   Mapbox Matrix) behind the `TravelTimeProvider` interface in `app/domain/travel.py`.

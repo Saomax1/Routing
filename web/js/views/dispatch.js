@@ -2,18 +2,17 @@
 // Read-only against Housecall Pro in this phase: a confirmed slot is saved in this app and added to the technician's
 // route here (a "booking"); dispatchers still enter it in HCP, and it drops off the Booked list once HCP shows it.
 
-import { h, render, icon, svgEl, fmtTime, fmtMinutes, fmtDay, fmtDateTime, fmtDuration, fmtDrive, fmtAge, fmtLeft, fmtPhone,
-  money, timeAgo, SOURCE_LABEL, toast } from '../dom.js';
+import { h, render, icon, svgEl, fmtTime, fmtMinutes, fmtDay, fmtDateTime, fmtDuration, fmtDrive, fmtLeft, fmtPhone,
+  money, timeAgo, toast } from '../dom.js';
 import { api } from '../api.js';
 import { SlippyMap } from '../map.js';
 
-const PRIO_CLASS = (p) => String(p || 'normal').toLowerCase();
 const onEnter = (fn) => (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fn(e); } };
 
 export function mountDispatch(root, ctx) {
   const { config } = ctx;
   const state = {
-    date: config.today, data: null, filters: { q: '', trade: '', source: '', priority: '', area: '' },
+    date: config.today, data: null, filters: { q: '', type: '', area: '' },
     view: 'queue', areas: null, areasLoading: false, areasError: null, areaDays: null,
     hidden: new Set(), selectedId: null, detail: null, detailLoading: false,
     slots: null, slotsFor: null, slotsLoading: false, slotDays: 3, hoverOpt: null, pinnedOpt: null,
@@ -61,9 +60,7 @@ export function mountDispatch(root, ctx) {
     if (!state.data) return [];
     const f = state.filters, q = f.q.trim().toLowerCase();
     return state.data.unscheduled.filter((u) => {
-      if (f.trade && u.trade_code !== f.trade) return false;
-      if (f.source && u.source_category !== f.source) return false;
-      if (f.priority && u.priority_label !== f.priority) return false;
+      if (f.type && u.type_label !== f.type) return false;
       if (f.area && u.area_key !== f.area) return false;
       if (q) {
         const hay = `${u.customer_name} ${u.address} ${u.summary} ${u.zip} ${u.city} ${(u.warranty && u.warranty.dispatch_number) || ''}`.toLowerCase();
@@ -120,7 +117,6 @@ export function mountDispatch(root, ctx) {
     if (state.view === 'areas') { renderAreas(); return; }
     if (state.view === 'booked') { renderBooked(); return; }
     const list = filtered();
-    const trades = [...new Set(state.data.unscheduled.map((u) => u.trade_code).filter(Boolean))].sort();
     const sel = (key, label, opts) => h('select', { 'aria-label': label, onchange: (e) => { state.filters[key] = e.target.value; renderQueue(); renderMap(false); } },
       h('option', { value: '' }, label), opts.map(([v, t]) => h('option', { value: v, selected: state.filters[key] === v }, t)));
     const search = h('input', { type: 'search', placeholder: 'Search name, address, problem, zip…', value: state.filters.q, 'aria-label': 'Search unscheduled jobs',
@@ -131,12 +127,10 @@ export function mountDispatch(root, ctx) {
       h('div', { class: 'q-title' }, h('h2', {}, 'Unscheduled'), h('span', { class: 'count' }, list.length === state.data.unscheduled.length ? `${list.length}` : `${list.length} of ${state.data.unscheduled.length}`)),
       search,
       h('div', { class: 'q-filters' },
-        sel('trade', 'All trades', trades.map((t) => [t, t])),
-        sel('source', 'All sources', Object.entries(SOURCE_LABEL)),
-        sel('priority', 'All priorities', ['Emergency', 'Expedited', 'Normal', 'Direct'].map((p) => [p, p])),
+        sel('type', 'All types', typeOptions()),
         sel('area', 'All areas', areaOptions())));
     const body = h('div', { class: 'q-list', role: 'list' },
-      list.length ? list.map((u, i) => queueRow(u, i + 1)) : h('div', { class: 'empty' }, state.data.unscheduled.length ? 'No jobs match these filters.' : 'No unscheduled jobs. Nice work.'));
+      list.length ? list.map(queueRow) : h('div', { class: 'empty' }, state.data.unscheduled.length ? 'No jobs match these filters.' : 'No unscheduled jobs. Nice work.'));
     render(queue, head, body);
     body.scrollTop = scroll;
   }
@@ -146,6 +140,13 @@ export function mountDispatch(root, ctx) {
     const m = new Map();
     for (const u of state.data.unscheduled) { const a = m.get(u.area_key) || { label: u.area, n: 0 }; a.n += 1; m.set(u.area_key, a); }
     return [...m.entries()].sort((a, b) => b[1].n - a[1].n || a[1].label.localeCompare(b[1].label)).map(([k, a]) => [k, `${a.label} (${a.n})`]);
+  }
+  // Expedited / Normal / Recall / Retail with how many of each are waiting (types with none are left out)
+  const TYPES = ['Expedited', 'Normal', 'Recall', 'Retail'];
+  function typeOptions() {
+    const n = Object.fromEntries(TYPES.map((t) => [t, 0]));
+    for (const u of state.data.unscheduled) n[u.type_label] = (n[u.type_label] || 0) + 1;
+    return TYPES.filter((t) => n[t]).map((t) => [t, `${t} (${n[t]})`]);
   }
   function viewTabs() {
     const tab = (id, label, count) => h('button', {
@@ -239,12 +240,8 @@ export function mountDispatch(root, ctx) {
   function areaCard(x, a) {
     const open = () => { state.filters.area = x.key; state.view = 'queue'; renderQueue(); renderMap(false); };
     const when = (t) => `${dayWord(t.date, a.today)} · ${fmtMinutes(t.window_start_min)}–${fmtMinutes(t.window_end_min)}`;
-    const chips = [];
-    if (x.overdue) chips.push(h('span', { class: 'chip dl-overdue', title: 'Past the deadline window' }, `${x.overdue} overdue`));
-    if (x.due_soon) chips.push(h('span', { class: 'chip dl-warning', title: 'Deadline window is closing' }, `${x.due_soon} due soon`));
-    if (x.excused) chips.push(h('span', { class: 'chip dl-excused', title: 'Deadline waived: these are being booked late on purpose' }, `${x.excused} deadline waived`));
-    for (const [trade, n] of Object.entries(x.by_trade).sort()) chips.push(badge(`${trade} ${n}`, 'trade'));
-    if (x.unlocated) chips.push(h('span', { class: 'chip warn', title: 'No map location, so openings cannot be checked for these' }, icon('mapoff', 12), ` ${x.unlocated} no location`));
+    const chips = TYPES.filter((t) => x.by_type[t]).map((t) => badge(`${x.by_type[t]} ${t}`, 'type'));
+    if (x.unlocated) chips.push(h('span', { class: 'chip dim', title: 'No map location, so openings cannot be checked for these' }, icon('mapoff', 12), ` ${x.unlocated} no location`));
     const checkable = x.count - x.unlocated;
     const e = x.earliest;
     const soon = e && e.date <= isoPlusDays(a.today, 1);
@@ -260,33 +257,21 @@ export function mountDispatch(root, ctx) {
   }
 
   function badge(text, cls = '', title = '') { return h('span', { class: `badge ${cls}`, title }, text); }
-  function chips(u) {
-    const out = [badge(SOURCE_LABEL[u.source_category] || u.source_category, `src src-${u.source_category}`)];
-    if (u.trade_code) out.push(badge(u.trade_code, 'trade'));
-    if (u.deadline_status === 'excused') out.push(h('span', { class: 'chip dl-excused', title: `Deadline waived: ${u.exception_label}` }, icon('clock', 12), ' deadline waived'));
-    else if (u.deadline_status !== 'none') out.push(h('span', { class: `chip dl-${u.deadline_status}`, title: 'Time left until the contact/schedule deadline (Admin > Settings). A target, not a hard limit.' }, icon('clock', 12), ' ', fmtLeft(u.deadline_hours_left)));
-    if (u.age_hours != null) out.push(h('span', { class: 'chip dim', title: 'Time since the job arrived in Housecall Pro' }, `waiting ${fmtAge(u.age_hours)}`));
-    if (u.urgency_flags.length) out.push(h('span', { class: 'chip urgent', title: 'Urgency keywords found in the problem text' }, icon('droplet', 12), ' ', u.urgency_flags.slice(0, 2).join(', ')));
-    if (u.warranty && u.warranty.do_not_collect_service_fee) out.push(h('span', { class: 'chip fee', title: 'Warranty notice: do not collect the trade service fee' }, 'no fee'));
-    if (u.lat == null) out.push(h('span', { class: 'chip warn', title: 'No map location yet' }, icon('mapoff', 12), ' no location'));
-    if (u.warranty && u.warranty.has_warnings) out.push(h('span', { class: 'chip warn', title: 'Some warranty fields could not be read; open the job to check' }, icon('alert', 12), ' check'));
-    return out;
-  }
-  function queueRow(u, rank) {
+  // One row per waiting call: the same red "!" as its pin on the map, its type, the customer and the address.
+  // Everything else (trade, deadline, score, warranty details) is on the job card once it is opened.
+  function queueRow(u) {
     const open = () => select(u.id);
     return h('div', {
-      class: `q-row prio-${PRIO_CLASS(u.priority_label)}${u.id === state.selectedId ? ' sel' : ''}`, role: 'listitem', tabindex: '0', 'data-id': u.id,
+      class: `q-row${u.id === state.selectedId ? ' sel' : ''}`, role: 'listitem', tabindex: '0', 'data-id': u.id,
       onclick: open, onkeydown: onEnter(open),
       onmouseenter: () => { map.highlight(u.id, true); }, onmouseleave: () => map.highlight(u.id, false),
       onfocus: () => map.highlight(u.id, true), onblur: () => map.highlight(u.id, false),
     },
-    h('div', { class: 'q-rank', title: 'Rank by priority score (matches the number on the map pin)' }, rank),
+    h('span', { class: 'q-mark', 'aria-hidden': 'true' }, '!'),
     h('div', { class: 'q-main' },
-      h('div', { class: 'q-top' }, badge(u.priority_label, `prio prio-${PRIO_CLASS(u.priority_label)}`), h('span', { class: 'q-name' }, u.customer_name || 'Unknown customer'),
-        h('span', { class: 'q-score', title: 'Priority score' }, Math.round(u.score))),
+      h('div', { class: 'q-top' }, h('span', { class: 'q-type' }, u.type_label), h('span', { class: 'q-name' }, u.customer_name || 'Unknown customer')),
       h('div', { class: 'q-addr' }, u.address || 'No address on this job'),
-      u.summary ? h('div', { class: 'q-sum' }, u.summary) : null,
-      h('div', { class: 'q-chips' }, chips(u))));
+      u.lat == null ? h('div', { class: 'q-noloc' }, icon('mapoff', 12), ' No map location yet') : null));
   }
 
   // ------------------------------------------------------------------- detail
@@ -314,16 +299,19 @@ export function mountDispatch(root, ctx) {
     const d = state.detail;
     const backBtn = h('button', { class: 'btn ghost', type: 'button', onclick: back }, icon('left', 14), state.view === 'booked' ? ' Booked' : ' Unscheduled');
     if (!d) { render(queue, h('header', { class: 'q-head' }, backBtn), h('div', { class: 'd-body' }, h('div', { class: 'empty' }, state.detailLoading ? 'Loading…' : 'Job not found.'))); return; }
-    const w = d.warranty, sc = d.score;
+    const isWarranty = d.type.kind === 'warranty';
+    const w = isWarranty ? d.warranty : null, sc = d.score;       // a retail job's old warranty text must not raise warranty alerts
     const hdr = h('header', { class: 'q-head d-head' },
       h('div', { class: 'd-toprow' }, backBtn, d.hcp_url ? h('a', { class: 'btn ghost', href: d.hcp_url, target: '_blank', rel: 'noopener noreferrer' }, icon('link', 14), ' Open in Housecall Pro') : null),
       h('h2', { class: 'd-name' }, d.customer_name || 'Unknown customer'),
-      h('div', { class: 'd-badges' }, badge(sc.priority_label, `prio prio-${PRIO_CLASS(sc.priority_label)}`), badge(SOURCE_LABEL[d.source_category], `src src-${d.source_category}`),
-        d.trade_code ? badge(d.trade_code, 'trade') : null, d.work_status !== 'unscheduled' ? badge(d.work_status.replace('_', ' '), 'dim') : null, d.booking ? badge('booked here', 'src') : null));
+      h('div', { class: 'd-badges' }, badge(d.type.label, 'type', isWarranty ? 'Warranty call' : 'Not a warranty-company call'),
+        d.type.ad_lead ? badge('Ad lead', 'type', `Tagged “${d.type.ad_tag}”`) : null,
+        d.trade_code ? badge(d.trade_code, 'trade') : null, d.work_status !== 'unscheduled' ? badge(d.work_status.replace('_', ' '), 'dim') : null, d.booking ? badge('booked here', 'type') : null));
 
     const alerts = [];
     if (w && w.do_not_collect_service_fee) alerts.push(h('div', { class: 'alert fee' }, h('b', {}, 'Do not collect the trade service fee.'), w.payment_type ? ` Payment type: ${w.payment_type}.` : ''));
     if (w && w.authorization_required) alerts.push(h('div', { class: 'alert warn' }, icon('alert', 14), ' Authorization is required before work starts.'));
+    if (d.type.warranty_text_without_tag) alerts.push(h('div', { class: 'alert info' }, icon('alert', 14), ' This job carries warranty dispatch text but no warranty tag, so it is treated as Retail (a warranty call turned into a retail job). If it should be warranty work, tag it in Housecall Pro.'));
     if (d.lat == null) alerts.push(h('div', { class: 'alert warn' }, icon('mapoff', 14), ` No map location (${d.geocode_status}). Check the address in Housecall Pro; slots cannot be computed without one.`));
 
     const dl = sc.deadline_status === 'excused'
@@ -524,25 +512,18 @@ export function mountDispatch(root, ctx) {
   }
 
   // --------------------------------------------------------------------- map
-  function makePin(u, rank) {
+  // Every unscheduled call is the same red "!". Colour only appears once a job is on a technician's route.
+  function makePin(u) {
     const sel = u.id === state.selectedId;
-    const el = h('div', { class: `pin src-${u.source_category} prio-${PRIO_CLASS(u.priority_label)} dl-${u.deadline_status}${sel ? ' sel' : ''}`, role: 'button', tabindex: '0',
-      'aria-label': `Rank ${rank}: ${u.priority_label} ${u.customer_name}, ${u.address}` });
+    const el = h('div', { class: `pin${sel ? ' sel' : ''}`, role: 'button', tabindex: '0', 'aria-label': `Unscheduled: ${u.type_label} ${u.customer_name}, ${u.address}` });
     const svg = svgEl('svg', { viewBox: '0 0 44 44', width: 40, height: 40 });
-    const shape = u.source_category === 'ahs' ? svgEl('rect', { x: 6, y: 6, width: 30, height: 30, rx: 7, class: 'shape' })
-      : u.source_category === 'other_warranty' ? svgEl('polygon', { points: '21,2 40,21 21,40 2,21', class: 'shape' })
-        : svgEl('circle', { cx: 21, cy: 21, r: 16, class: 'shape' });
-    svg.append(shape, svgEl('text', { x: 21, y: 26, 'text-anchor': 'middle', class: 'pin-num', text: String(rank) }));
-    if (u.urgency_flags.length) {
-      svg.append(svgEl('circle', { cx: 35, cy: 9, r: 8, class: 'badge-bg' }),
-        svgEl('path', { d: 'M35 4.2s3.6 3.8 3.6 6.4a3.6 3.6 0 0 1-7.2 0c0-2.6 3.6-6.4 3.6-6.4z', class: 'badge-drop' }));
-    }
+    svg.append(svgEl('circle', { cx: 21, cy: 21, r: 16, class: 'shape' }), svgEl('text', { x: 21, y: 27, 'text-anchor': 'middle', class: 'pin-num', text: '!' }));
     el.append(svg);
     const open = () => select(u.id);
     el.addEventListener('click', open); el.addEventListener('keydown', onEnter(open));
     el.addEventListener('mouseenter', () => { const row = queue.querySelector(`.q-row[data-id="${CSS.escape(u.id)}"]`); if (row) { row.classList.add('hl'); row.scrollIntoView({ block: 'nearest' }); } });
     el.addEventListener('mouseleave', () => { const row = queue.querySelector(`.q-row[data-id="${CSS.escape(u.id)}"]`); if (row) row.classList.remove('hl'); });
-    map.tip(el, [`${rank}. ${u.priority_label} · ${u.customer_name || 'Unknown'}`, u.address, u.summary, `${SOURCE_LABEL[u.source_category]}${u.trade_code ? ' · ' + u.trade_code : ''} · score ${Math.round(u.score)}${u.deadline_status === 'excused' ? ' · deadline waived' : u.deadline_status !== 'none' ? ' · ' + fmtLeft(u.deadline_hours_left) : ''}`].filter(Boolean));
+    map.tip(el, [`${u.type_label} · ${u.customer_name || 'Unknown'}`, u.address].filter(Boolean));
     return el;
   }
   function makeStop(s, t) {
@@ -626,10 +607,10 @@ export function mountDispatch(root, ctx) {
     for (const s of d.unassigned_scheduled) if (s.lat != null) { map.addMarker(`stop:${s.id}`, s.lat, s.lng, makeStop(s, null), 4); pts.push([s.lat, s.lng]); }
 
     const list = filtered();
-    list.forEach((u, i) => { if (u.lat != null) { map.addMarker(u.id, u.lat, u.lng, makePin(u, i + 1), u.id === state.selectedId ? 40 : 20); pts.push([u.lat, u.lng]); } });
+    list.forEach((u) => { if (u.lat != null) { map.addMarker(u.id, u.lat, u.lng, makePin(u), u.id === state.selectedId ? 40 : 20); pts.push([u.lat, u.lng]); } });
     if (state.selectedId && !list.some((u) => u.id === state.selectedId)) {   // selected job hidden by filters: still show it
       const u = d.unscheduled.find((x) => x.id === state.selectedId);
-      if (u && u.lat != null) map.addMarker(u.id, u.lat, u.lng, makePin(u, d.unscheduled.indexOf(u) + 1), 40);
+      if (u && u.lat != null) map.addMarker(u.id, u.lat, u.lng, makePin(u), 40);
     }
 
     // slot preview (hover or pinned), drawn on top
@@ -665,17 +646,11 @@ export function mountDispatch(root, ctx) {
 }
 
 function buildLegend() {
-  const shape = (kind, label) => {
-    const svg = svgEl('svg', { viewBox: '0 0 20 20', width: 16, height: 16 });
-    svg.append(kind === 'ahs' ? svgEl('rect', { x: 3, y: 3, width: 14, height: 14, rx: 3, class: 'lg-shape' })
-      : kind === 'other' ? svgEl('polygon', { points: '10,1 19,10 10,19 1,10', class: 'lg-shape' }) : svgEl('circle', { cx: 10, cy: 10, r: 7.5, class: 'lg-shape' }));
-    return h('span', { class: 'lg-item' }, svg, label);
-  };
+  const pin = h('span', { class: 'lg-bang', 'aria-hidden': 'true' }, '!');
   const dot = (cls, label) => h('span', { class: 'lg-item' }, h('span', { class: `lg-dot ${cls}` }), label);
-  const el = h('details', { class: 'dp-legend' }, h('summary', {}, 'Legend'),
-    h('div', { class: 'lg-row' }, h('b', {}, 'Shape'), shape('ahs', 'AHS'), shape('other', 'Other warranty'), shape('direct', 'Direct lead')),
-    h('div', { class: 'lg-row' }, h('b', {}, 'Color'), dot('prio-emergency', 'Emergency'), dot('prio-expedited', 'Expedited'), dot('prio-normal', 'Normal'), dot('prio-direct', 'Direct')),
-    h('div', { class: 'lg-row' }, h('b', {}, 'Ring'), dot('ring-warning', 'deadline closing'), dot('ring-critical', 'critical'), dot('ring-overdue', 'overdue'), h('span', { class: 'dim' }, '(none = deadline waived or no deadline)')),
-    h('div', { class: 'lg-row dim' }, 'Numbers = queue rank · water drop = urgency keyword · colored circles = scheduled stops by technician (✓ = finished, dashed = booked here, not in Housecall Pro yet) · hover a route line for its drive time'));
-  return el;
+  return h('details', { class: 'dp-legend' }, h('summary', {}, 'Legend'),
+    h('div', { class: 'lg-row' }, h('span', { class: 'lg-item' }, pin, 'Unscheduled call (open it to see its type and details)')),
+    h('div', { class: 'lg-row' }, h('span', { class: 'lg-item' }, h('span', { class: 'lg-dot tech' }), 'Scheduled stop, in its technician’s color (number = order in the route)'),
+      h('span', { class: 'lg-item' }, h('span', { class: 'lg-dot tech done' }), 'finished'), h('span', { class: 'lg-item' }, h('span', { class: 'lg-dot tech booked' }), 'booked here, not in Housecall Pro yet')),
+    h('div', { class: 'lg-row dim' }, 'Hover a route line for its drive time.'));
 }

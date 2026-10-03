@@ -26,49 +26,67 @@ class GridTravel:
 
 # ---------------------------------------------------------------------------- scoring
 
+TAG = {"Expedited": "normal: expedited", "Normal": "normal: normal", "Recall": "normal: recall"}
+
+
 class ScoringTests(unittest.TestCase):
     NOW = datetime(2026, 10, 1, 20, 0, tzinfo=UTC)
 
-    def job(self, hours_ago, category="ahs", desc=""):
-        return {"source_category": category, "description_raw": desc,
+    def job(self, hours_ago, tier=None, desc="", tags=None):
+        """A warranty job carries the Housecall Pro tag for its tier; a job with none is Retail."""
+        return {"tags": ([TAG[tier]] if tier else []) + list(tags or []), "description_raw": desc,
                 "hcp_created_at": to_iso(self.NOW - timedelta(hours=hours_ago))}
 
-    def warranty(self, prio, items=None):
-        return {"dispatch_priority": prio, "data": {"items": items or []}}
+    def warranty(self, items=None):
+        return {"data": {"items": items or []}}
 
     def labels(self, res):
         return {b["label"]: b["points"] for b in res["breakdown"]}
 
-    def test_emergency_has_no_deadline_clock(self):
-        res = score_job(self.job(3), self.warranty("Emergency", [{"name": "Water Leak", "problem": "secondary damage"}]),
-                        SETTINGS, self.NOW)
-        lab = self.labels(res)
-        self.assertEqual(lab["Priority: Emergency"], 100)
-        self.assertEqual(res["deadline_status"], "none")           # the old 4 h AHS Emergency rule is gone
-        self.assertIsNone(res["deadline_at"])
-        self.assertIsNone(res["deadline_hours_left"])
-        self.assertFalse(any(k.startswith("Deadline") for k in lab))
-        self.assertEqual(lab["Urgency: secondary damage, leak"] if "Urgency: secondary damage, leak" in lab
-                         else lab["Urgency: leak, secondary damage"], 20)
-        self.assertEqual(res["priority_label"], "Emergency")
-
     def test_expedited_close_to_deadline(self):
-        res = score_job(self.job(18), self.warranty("Expedited"), SETTINGS, self.NOW)
+        res = score_job(self.job(18, "Expedited"), self.warranty(), SETTINGS, self.NOW)
+        self.assertEqual((res["priority_label"], res["kind"]), ("Expedited", "warranty"))
         self.assertEqual(res["deadline_status"], "critical")       # 6h of a 24h window left = 25%
         self.assertEqual(self.labels(res)["Deadline critical"], 30)
         self.assertAlmostEqual(res["deadline_hours_left"], 6.0, places=1)
 
     def test_normal_window_is_48_hours(self):
-        for category in ("ahs", "other_warranty"):
-            for hours_ago, status, left in ((10, "ok", 38), (30, "warning", 18), (46, "critical", 2), (49, "overdue", -1)):
-                res = score_job(self.job(hours_ago, category), self.warranty("Normal"), SETTINGS, self.NOW)
-                self.assertEqual(res["deadline_status"], status, (category, hours_ago))
-                self.assertAlmostEqual(res["deadline_hours_left"], left, places=1)
+        for hours_ago, status, left in ((10, "ok", 38), (30, "warning", 18), (46, "critical", 2), (49, "overdue", -1)):
+            res = score_job(self.job(hours_ago, "Normal"), self.warranty(), SETTINGS, self.NOW)
+            self.assertEqual(res["deadline_status"], status, hours_ago)
+            self.assertAlmostEqual(res["deadline_hours_left"], left, places=1)
+
+    def test_recall_is_its_own_type_between_normal_and_expedited(self):
+        res = score_job(self.job(1, "Recall"), self.warranty(), SETTINGS, self.NOW)
+        self.assertEqual((res["priority_label"], res["kind"]), ("Recall", "warranty"))
+        self.assertEqual(self.labels(res)["Warranty: Recall"], 40)
+        self.assertEqual(res["deadline_status"], "ok")
+        self.assertAlmostEqual(score_job(self.job(30, "Recall"), None, SETTINGS, self.NOW)["deadline_hours_left"], -6.0, places=1)   # 24 h window
+
+    def test_a_job_without_a_warranty_tag_is_retail(self):
+        res = score_job(self.job(0.5, None, "AC not blowing cold"), None, SETTINGS, self.NOW)
+        self.assertEqual((res["priority_label"], res["kind"], res["ad_lead"]), ("Retail", "retail", False))
+        self.assertEqual(self.labels(res)["Retail"], 30)
+
+    def test_an_ad_lead_is_retail_and_says_so(self):
+        res = score_job(self.job(0.5, None, tags=["Meta Lead"]), None, SETTINGS, self.NOW)
+        self.assertEqual((res["priority_label"], res["ad_lead"]), ("Retail", True))
+        self.assertEqual(self.labels(res)["Retail (ad lead)"], 30)
+
+    def test_a_converted_warranty_call_is_retail_and_flagged(self):
+        """It still has the old dispatch text but no warranty tag: retail, with a note, and no warranty points."""
+        res = score_job(self.job(1, None, tags=["warranty", "ahs"]), self.warranty([{"name": "Toilet", "problem": "Leak"}]), SETTINGS, self.NOW)
+        self.assertEqual((res["priority_label"], res["kind"], res["warranty_text_without_tag"]), ("Retail", "retail", True))
+        self.assertEqual(self.labels(res)["Retail"], 30)
+
+    def test_retail_deadline_is_its_own_rule(self):
+        self.assertEqual(score_job(self.job(30, None), None, SETTINGS, self.NOW)["deadline_status"], "overdue")      # 24 h
+        self.assertEqual(score_job(self.job(5, None), None, SETTINGS, self.NOW)["deadline_status"], "ok")
 
     def test_exception_excuses_the_deadline(self):
         exc = {"reason": "customer_unavailable", "reason_label": "Customer not available", "note": "back Monday"}
-        plain = score_job(self.job(100), self.warranty("Normal"), SETTINGS, self.NOW)
-        excused = score_job(self.job(100), self.warranty("Normal"), SETTINGS, self.NOW, exc)
+        plain = score_job(self.job(100, "Normal"), self.warranty(), SETTINGS, self.NOW)
+        excused = score_job(self.job(100, "Normal"), self.warranty(), SETTINGS, self.NOW, exc)
         self.assertEqual(plain["deadline_status"], "overdue")
         self.assertEqual(excused["deadline_status"], "excused")
         self.assertNotIn("Deadline overdue", self.labels(excused))
@@ -79,59 +97,55 @@ class ScoringTests(unittest.TestCase):
         self.assertTrue(any("Customer not available" in b["label"] for b in excused["breakdown"]))
 
     def test_exception_on_a_job_with_no_deadline_rule_changes_nothing(self):
+        no_rule = dict(SETTINGS, deadline_rules={"WARRANTY": {"Normal": 48}})      # Expedited has no clock here
         exc = {"reason": "other", "reason_label": "Other", "note": "x"}
-        res = score_job(self.job(3), self.warranty("Emergency"), SETTINGS, self.NOW, exc)
-        self.assertEqual(res["deadline_status"], "none")
+        res = score_job(self.job(3, "Expedited"), self.warranty(), no_rule, self.NOW, exc)
+        self.assertEqual((res["deadline_status"], res["deadline_at"], res["deadline_hours_left"]), ("none", None, None))
 
     def test_normal_fresh_job_has_no_deadline_points(self):
-        res = score_job(self.job(1), self.warranty("Normal"), SETTINGS, self.NOW)
+        res = score_job(self.job(1, "Normal"), self.warranty(), SETTINGS, self.NOW)
         self.assertEqual(res["deadline_status"], "ok")
         self.assertNotIn("Deadline ok", self.labels(res))
         self.assertLess(res["total"], 25)
 
     def test_overdue(self):
-        res = score_job(self.job(100), self.warranty("Normal"), SETTINGS, self.NOW)   # 48h window
+        res = score_job(self.job(100, "Normal"), self.warranty(), SETTINGS, self.NOW)   # 48h window
         self.assertEqual(res["deadline_status"], "overdue")
         self.assertLess(res["deadline_hours_left"], 0)
         self.assertEqual(self.labels(res)["Deadline overdue"], 40)
 
     def test_priority_ordering(self):
-        e = score_job(self.job(5), self.warranty("Emergency"), SETTINGS, self.NOW)["total"]
-        x = score_job(self.job(5), self.warranty("Expedited"), SETTINGS, self.NOW)["total"]
-        n = score_job(self.job(5), self.warranty("Normal"), SETTINGS, self.NOW)["total"]
-        self.assertGreater(e, x)
-        self.assertGreater(x, n)
-
-    def test_direct_lead(self):
-        res = score_job(self.job(0.5, "direct", "AC not blowing cold"), None, SETTINGS, self.NOW)
-        self.assertEqual(res["priority_label"], "Direct")
-        self.assertEqual(self.labels(res)["Direct lead"], 30)
+        total = lambda tier: score_job(self.job(5, tier), self.warranty(), SETTINGS, self.NOW)["total"]
+        self.assertGreater(total("Expedited"), total("Recall"))
+        self.assertGreater(total("Recall"), total(None))                       # Retail
+        self.assertGreater(total(None), total("Normal"))
 
     def test_urgency_points_are_capped(self):
         text = "leak flood burst sewage backup gas"
-        res = score_job(self.job(1, "direct", text), None, SETTINGS, self.NOW)
+        res = score_job(self.job(1, None, text), None, SETTINGS, self.NOW)
         urg = [b for b in res["breakdown"] if b["label"].startswith("Urgency")][0]
         self.assertEqual(urg["points"], SETTINGS["scoring"]["urgency_points_cap"])
 
     def test_age_points_are_capped(self):
-        res = score_job(self.job(24 * 60), self.warranty("Normal"), SETTINGS, self.NOW)
+        res = score_job(self.job(24 * 60, "Normal"), self.warranty(), SETTINGS, self.NOW)
         age = [b for b in res["breakdown"] if b["label"].startswith("Waiting")][0]
         self.assertEqual(age["points"], SETTINGS["scoring"]["age_points_cap"])
 
     def test_missing_created_date(self):
-        res = score_job({"source_category": "ahs"}, self.warranty("Expedited"), SETTINGS, self.NOW)
+        res = score_job({"tags": [TAG["Expedited"]]}, self.warranty(), SETTINGS, self.NOW)
         self.assertEqual(res["deadline_status"], "none")
         self.assertIsNone(res["deadline_at"])
         self.assertEqual(res["total"], 60)
 
-    def test_unknown_priority_is_treated_as_normal(self):
-        res = score_job(self.job(1), self.warranty(None), SETTINGS, self.NOW)
-        self.assertIn("treated as Normal", res["breakdown"][0]["label"])
-
     def test_weights_come_from_settings(self):
-        s = deep_merge(SETTINGS, {"scoring": {"base_by_priority": {"Expedited": 77}}})
-        res = score_job(self.job(1), self.warranty("Expedited"), s, self.NOW)
-        self.assertEqual(self.labels(res)["Priority: Expedited"], 77)
+        s = deep_merge(SETTINGS, {"scoring": {"base_by_priority": {"Expedited": 77}, "base_retail": 5}})
+        self.assertEqual(self.labels(score_job(self.job(1, "Expedited"), self.warranty(), s, self.NOW))["Warranty: Expedited"], 77)
+        self.assertEqual(self.labels(score_job(self.job(1, None), None, s, self.NOW))["Retail"], 5)
+
+    def test_the_tag_names_come_from_settings_too(self):
+        s = deep_merge(SETTINGS, {"job_types": {"warranty_tags": {"Expedited": ["Rush job"]}}})
+        res = score_job({"tags": ["Rush Job"], "hcp_created_at": to_iso(self.NOW)}, None, s, self.NOW)
+        self.assertEqual((res["priority_label"], res["kind"]), ("Expedited", "warranty"))
 
 
 # -------------------------------------------------------------------------- durations
@@ -262,14 +276,14 @@ class SlotTests(unittest.TestCase):
         self.assertGreaterEqual(res["options"][0]["start_min"], 10 * 60 + 37)  # >= 10:07 + 30 min lead
         self.assertEqual(res["options"][0]["start_min"] % 5, 0)
 
-    def test_emergency_prefers_today_normal_prefers_cheaper_tomorrow(self):
+    def test_expedited_prefers_today_normal_prefers_cheaper_tomorrow(self):
         # Today the tech has a short job far away at (0,100) 08:30-09:00. The new job at (0,20) can only
         # go AFTER it (before it, the tech could not reach A by 08:30), costing 80 min of added driving.
-        # Tomorrow's empty day costs only 20 min (home -> job). Emergency (240 min/day delay penalty)
+        # Tomorrow's empty day costs only 20 min (home -> job). Expedited (90 min/day delay penalty)
         # should still take today; Normal (15 min/day) should take the cheaper tomorrow.
         sched = {("t1", self.THU): [stop("A", 0, 100, 8, 30, 30)]}
         t = tech(home=(0, 0))
-        em = self.run_slots([t], sched, days=[self.THU, self.FRI], prio="Emergency")
+        em = self.run_slots([t], sched, days=[self.THU, self.FRI], prio="Expedited")
         no = self.run_slots([t], sched, days=[self.THU, self.FRI], prio="Normal")
         self.assertEqual(em["options"][0]["date"], self.THU.isoformat())
         self.assertEqual(no["options"][0]["date"], self.FRI.isoformat())
@@ -567,20 +581,30 @@ class MiscTests(unittest.TestCase):
 
     def test_default_deadline_rules(self):
         rules = DEFAULT_SETTINGS["deadline_rules"]
-        self.assertNotIn("Emergency", rules["AHS"])                 # AHS Emergency has no deadline clock
-        self.assertEqual(rules["AHS"]["Normal"], 48)
-        self.assertEqual(rules["OTHER_WARRANTY"]["Normal"], 48)
+        self.assertEqual(set(rules), {"WARRANTY", "RETAIL"})
+        self.assertEqual(set(rules["WARRANTY"]), {"Expedited", "Normal", "Recall"})       # warranty work has three types
+        self.assertEqual(rules["WARRANTY"]["Normal"], 48)
+        self.assertEqual(set(rules["RETAIL"]), {"Retail"})
+        self.assertEqual(set(DEFAULT_SETTINGS["scoring"]["base_by_priority"]), {"Expedited", "Normal", "Recall"})
+        self.assertEqual(set(DEFAULT_SETTINGS["scheduling"]["day_penalty_minutes"]), {"Expedited", "Normal", "Recall", "Retail"})
+        self.assertEqual(DEFAULT_SETTINGS["job_types"]["warranty_tags"], {"Expedited": ["normal: expedited"], "Normal": ["normal: normal"],
+                                                                         "Recall": ["normal: recall"]})
+        self.assertEqual(DEFAULT_SETTINGS["job_types"]["ad_lead_tags"], ["meta lead"])
         self.assertEqual(DEFAULT_SETTINGS["areas"]["group_by"], "city")
         sched = DEFAULT_SETTINGS["scheduling"]
         self.assertEqual((sched["window_minutes"], sched["window_step_minutes"], sched["stack_within_minutes"]), (240, 60, 20))
 
     def test_settings_validation(self):
-        validate_settings({"scoring": {"base_direct_lead": 40}})
+        validate_settings({"scoring": {"base_retail": 40}})
+        validate_settings({"job_types": {"warranty_tags": {"Recall": ["Normal: Recall", "callback"]}, "ad_lead_tags": ["Meta Lead", "Facebook"]}})
         validate_settings({"areas": {"group_by": "zip"}})
         validate_settings({"scheduling": {"window_minutes": 180, "window_step_minutes": 30, "stack_within_minutes": 0}})
-        for bad in ({"scoring": {"base_direct_lead": "x"}}, {"nope": 1}, {"timezone": "Mars/Base"},
-                    {"deadline_rules": {"AHS": {"Normal": -1}}}, {"map": {"tile_url": "http://insecure/{z}/{x}/{y}"}},
-                    {"deadline_rules": {"AHS": 5}}, {"areas": {"group_by": "county"}}, {"areas": {"nope": 1}},
+        for bad in ({"scoring": {"base_retail": "x"}}, {"nope": 1}, {"timezone": "Mars/Base"},
+                    {"deadline_rules": {"WARRANTY": {"Normal": -1}}}, {"map": {"tile_url": "http://insecure/{z}/{x}/{y}"}},
+                    {"deadline_rules": {"WARRANTY": 5}}, {"scoring": {"base_direct_lead": 30}}, {"scoring": {"base_by_priority": {"Emergency": 100}}},
+                    {"job_types": {"warranty_tags": {"Emergency": ["x"]}}}, {"job_types": {"warranty_tags": {"Normal": "normal: normal"}}},
+                    {"job_types": {"warranty_tags": {"Normal": ["same"], "Recall": ["Same "]}}}, {"job_types": {"ad_lead_tags": ["  "]}},
+                    {"job_types": {"warranty_tags": {"Normal": [5]}}}, {"job_types": {"ad_lead_tags": ["x" * 81]}}, {"areas": {"group_by": "county"}}, {"areas": {"nope": 1}},
                     {"scheduling": {"window_minutes": 5}}, {"scheduling": {"window_minutes": 721}},
                     {"scheduling": {"window_step_minutes": 0}}, {"scheduling": {"stack_within_minutes": -1}},
                     {"scheduling": {"stack_within_minutes": 500}}):
