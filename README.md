@@ -101,6 +101,24 @@ Housecall Pro data, so flipping `.env` back to mock by mistake cannot put fake j
 Prefer to do it by hand? Set `HCP_MODE=live`, `HCP_API_KEY=...`, `GEOCODER=census` (and optionally `ROUTER`) in `.env` and
 restart; the same cleanup applies.
 
+### Testing against real data without it reaching GitHub
+
+If you test with a real key somewhere that also pushes to GitHub (a cloud session, a shared machine), turn on the leak guard first:
+
+```bash
+python scripts/install_git_guard.py
+```
+
+Git then runs `scripts/leak_check.py` before every commit, every commit message and every push. It learns what to look for from the
+real data on that machine (the API keys in the environment, and from the database every real customer name, phone number and
+street address, warranty contact, technician home address, login email and dispatcher note) and **blocks the commit or push if any
+of it appears**, in a file, a file name or a message. It never prints what it found, only the kind and where. It also refuses any
+binary file (a screenshot of the real app can show customers and cannot be scanned), and **it fails closed**: with an API key set
+but no readable customer database it refuses instead of passing. The push check still catches commits made with `--no-verify`.
+Keep the live database and the reports outside the repository (`DATABASE_PATH=...`, `--out ...`); `data/`, `.env`, `*.db` and
+the report files are git-ignored anyway. `CLAUDE.md` carries these rules and the step-by-step live-test procedure for any new
+Claude session on this repo.
+
 ## Environment variables
 
 See [`.env.example`](.env.example) for the full annotated list. The important ones:
@@ -222,6 +240,8 @@ See [`.env.example`](.env.example) for the full annotated list. The important on
 - HCP, maps and LLM keys stay on the server. They are redacted from config logging and never reach the browser or git.
 - Road routing sends stop coordinates (customer locations) to the routing provider (`ROUTER`), and only to it. Errors are
   logged by type only, never with coordinates. With live data it stays off until you set `ROUTER`.
+- Real customer data and keys are kept out of git by a guard that checks every commit, message and push against the live data
+  (see *Testing against real data without it reaching GitHub*).
 - Login with `admin` and `dispatcher` roles; passwords hashed with scrypt (minimum 10 characters); failed logins are
   rate-limited; the session ID rotates on login.
 - Mutating `/api` calls require the `X-Requested-With: routing-app` header (CSRF defense); strict CSP and security
@@ -264,7 +284,7 @@ app/            backend (api.py, main.py, config.py, db.py, security.py)
 app/domain/     pure logic: parser, scoring, travel, slots, time helpers
 app/hcp/        HCP client (live + mock), normalizer, demo fixtures
 app/services/   sync, geocoding, AI fallback, dispatch views, settings, bookings, slot confirmation, road routes
-scripts/        go_live.py, live_check.py, phase0_probe.py, seed.py, create_user.py
+scripts/        go_live.py, live_check.py, phase0_probe.py, seed.py, create_user.py, leak_check.py + githooks/ (the leak guard)
 web/            no-build front end (index.html, css/, js/)
 tests/          unittest suite + sanitized fixtures
 ```

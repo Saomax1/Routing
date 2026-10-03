@@ -11,3 +11,8 @@ __pycache__/
 .venv/
 venv/
 .DS_Store
+# anything produced by testing against real Housecall Pro data
+live_check_report*.json
+phase0_report*.json
+*.sqlite
+*.sqlite3

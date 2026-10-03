@@ -235,6 +235,7 @@ def main():
     ap.add_argument("--limit", type=int, default=20)
     ap.add_argument("--show-failures", action="store_true")
     ap.add_argument("--mock", action="store_true", help="run against the built-in demo data (tests the script itself)")
+    ap.add_argument("--out", default=os.path.join("data", "phase0_report.json"), help="where to write the report")
     args = ap.parse_args()
     cfg = load_config()
     if args.mock:
@@ -243,7 +244,7 @@ def main():
         if not cfg.hcp_api_key:
             sys.exit("HCP_API_KEY is not set. Put it in .env (never in git) and run again, or use --mock.")
         client = HCPClient(cfg)
-    run_probe(client, args.limit, args.show_failures, out_path=os.path.join("data", "phase0_report.json"))
+    run_probe(client, args.limit, args.show_failures, out_path=args.out)
 
 
 if __name__ == "__main__":

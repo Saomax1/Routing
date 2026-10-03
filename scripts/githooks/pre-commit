@@ -1,0 +1,5 @@
+#!/bin/sh
+# Refuse a commit that contains real customer information, an API key, or a binary file (see scripts/leak_check.py).
+HERE=$(cd "$(dirname "$0")" && pwd)
+PY=$(command -v python3 || command -v python) || { echo "leak check: python was not found, so this commit cannot be checked" >&2; exit 2; }
+exec "$PY" "$HERE/../leak_check.py" --staged
