@@ -6,12 +6,15 @@ Every run:
      jobs HCP has marked COMPLETE over the last few days (they stay on the map as done, work_status = 'complete')
   2. for each job: normalise, parse warranty text (only if the description changed), geocode
      (cached; only if the address changed), upsert
-  3. marks open jobs HCP no longer returns (inside our window) as inactive so they leave the map
+  3. marks open jobs HCP no longer returns (inside our window) as inactive so they leave the map. A job HCP did return
+     is never marked inactive because storing it failed, and nothing is marked inactive when the lists were cut short
+     at the page cap
   4. forgets bookings made in this app that HCP now shows as scheduled (see services/bookings.py)
 
 Design notes
 * Read-only against HCP in this phase.
-* One bad record never aborts the run: each job is processed inside a savepoint and counted as an error.
+* One bad record never aborts the run: each job is its own transaction, rolled back and counted as an error if it
+  fails. An unexpected failure elsewhere ends the run as 'error' (never stuck on 'running') and the next run starts clean.
 * Commits after every job so a slow geocode call never holds the SQLite write lock.
 * Nothing in here logs descriptions, names or phone numbers - only counts and ids.
 """
@@ -75,10 +78,24 @@ class SyncService:
         if refusal:
             self._finish(run_id, "error", 0, 0, refusal)
             return {"status": "error", "error": refusal}
+        try:
+            return self._pull_and_store(run_id, settings, now)
+        except Exception as e:    # anything unexpected: never leave the run 'running', and let the next run try again
+            msg = f"unexpected {type(e).__name__}"
+            log.error("sync crashed: %s", type(e).__name__)
+            try:
+                self._finish(run_id, "error", 0, 0, msg)
+            except Exception:
+                log.error("sync: could not record the failed run")
+            return {"status": "error", "error": msg}
+
+    def _pull_and_store(self, run_id: int, settings: dict, now: datetime) -> dict:
         tz = ZoneInfo(settings["timezone"])
         today = now.astimezone(tz).date()
         end = today + timedelta(days=self.cfg.scheduled_window_days)
 
+        if hasattr(self.hcp, "truncated"):
+            self.hcp.truncated = False       # the client only ever sets the flag: every run starts without it
         try:
             employees = self.hcp.list_employees()
             unscheduled = self.hcp.list_unscheduled()
@@ -97,9 +114,10 @@ class SyncService:
             completed_error = type(e).__name__
             log.warning("sync: could not fetch completed jobs (%s)", completed_error)
 
+        truncated = bool(getattr(self.hcp, "truncated", False))
         window_lo = to_iso(at_local_minutes(today, 0, tz))
         window_hi = to_iso(at_local_minutes(end + timedelta(days=1), 0, tz))
-        seen, changed, errors = set(), 0, 0
+        seen, returned, changed, errors = set(), set(), 0, 0      # seen = stored this run; returned = listed by HCP
 
         conn = self.db._connect()
         try:
@@ -110,23 +128,23 @@ class SyncService:
                     n = normalize_job(raw)
                     if not n["hcp_job_id"]:
                         continue
-                    conn.execute("SAVEPOINT job")
+                    returned.add(n["hcp_job_id"])       # HCP still has it, even if storing it fails below
+                    # One job = one transaction. It is deliberately NOT opened up front (no SAVEPOINT): SQLite starts
+                    # it at the job's first write, which comes after any geocoder / AI wait. Opening it earlier would
+                    # hold a read snapshot across that wait, and a dispatcher saving anything meanwhile would make this
+                    # job's write fail at once with "database is locked".
                     changed += 1 if self._upsert_job(conn, n, settings, now) else 0
-                    conn.execute("RELEASE job")
                     conn.commit()
                     seen.add(n["hcp_job_id"])
                 except Exception as e:
                     errors += 1
                     log.warning("sync: skipped a job (%s)", type(e).__name__)
-                    try:
-                        conn.execute("ROLLBACK TO job")
-                        conn.execute("RELEASE job")
-                        conn.commit()
-                    except Exception:
-                        conn.rollback()
-            # deactivate what HCP no longer returns inside our window (completed jobs are history: they stay)
-            for r in conn.execute("SELECT hcp_job_id, work_status, scheduled_start FROM jobs WHERE active = 1").fetchall():
-                if r["hcp_job_id"] in seen or r["work_status"] == "complete":
+                    conn.rollback()                     # undoes whatever this job had written; earlier jobs are committed
+            # deactivate what HCP no longer returns inside our window (completed jobs are history: they stay). Not when
+            # the list was cut short at the page cap: a job missing from it may simply not have been fetched.
+            for r in ([] if truncated else
+                      conn.execute("SELECT hcp_job_id, work_status, scheduled_start FROM jobs WHERE active = 1").fetchall()):
+                if r["hcp_job_id"] in returned or r["work_status"] == "complete":
                     continue
                 in_window = r["work_status"] == "unscheduled" or (
                     r["scheduled_start"] and window_lo <= r["scheduled_start"] < window_hi)
@@ -144,8 +162,8 @@ class SyncService:
             note.append(f"{errors} job(s) could not be processed")
         if completed_error:
             note.append(f"completed jobs could not be fetched ({completed_error})")
-        if getattr(self.hcp, "truncated", False):
-            note.append("HCP result list was truncated at the page cap")
+        if truncated:
+            note.append("HCP result list was truncated at the page cap (jobs it did not return were left as they were)")
         self._finish(run_id, status, len(seen), changed, "; ".join(note) or None)
         log.info("sync %s: %d jobs seen, %d changed, %d errors", status, len(seen), changed, errors)
         return {"status": status, "jobs_seen": len(seen), "jobs_changed": changed, "errors": errors}

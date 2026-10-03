@@ -326,7 +326,9 @@ def technician_update(ctx: Ctx, body):
             raise ApiError(404, "Technician not found")
         sets, vals = {}, {}
         if "active" in body:
-            sets["active"] = 1 if bool(body["active"]) else 0
+            if not isinstance(body["active"], bool):
+                raise ApiError(400, "active must be true or false")
+            sets["active"] = 1 if body["active"] else 0
         if "trade_skills" in body:
             skills = body["trade_skills"]
             if not isinstance(skills, list) or len(skills) > 10:
@@ -350,7 +352,8 @@ def technician_update(ctx: Ctx, body):
             raise ApiError(400, "Shift end must be after shift start")
         if "work_days" in body:
             wd = body["work_days"]
-            if not isinstance(wd, list) or not all(isinstance(x, int) and 0 <= x <= 6 for x in wd):
+            if not isinstance(wd, list) or not all(isinstance(x, int) and not isinstance(x, bool) and 0 <= x <= 6
+                                                   for x in wd):
                 raise ApiError(400, "work_days must be a list of 0-6 (Monday=0)")
             sets["work_days"] = jdump(sorted(set(wd)))
         if "max_jobs_per_day" in body:

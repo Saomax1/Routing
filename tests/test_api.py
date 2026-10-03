@@ -8,6 +8,7 @@ from unittest import mock
 from app import api as api_module
 from app.config import Config
 from app.main import bootstrap_users, create_app
+from app.security import LoginLimiter
 from tests.asgi_client import Client
 
 ADMIN = ("boss@example.com", "correct-horse-battery")
@@ -508,6 +509,40 @@ class AdminApiTests(ApiBase):
             {"trade_code": "*", "keyword": "", "minutes": 60}, {"trade_code": "PLB", "keyword": "", "minutes": 60},
             {"trade_code": "HVAC", "keyword": "", "minutes": 75}]})
 
+    def test_settings_that_would_break_the_app_are_refused_and_the_app_keeps_working(self):
+        a = self.admin
+        for bad in ({"urgency_keywords": [1, "leak"]}, {"urgency_keywords": ["", "leak"]}, {"urgency_keywords": ["x" * 81]},
+                    {"scheduling": {"top_n": 0}}, {"scheduling": {"top_n": -3}}, {"scheduling": {"search_days": 30}},
+                    {"scheduling": {"travel_speed_mph": 0}}, {"scheduling": {"round_to_minutes": 0}},
+                    {"scheduling": {"default_duration_minutes": 0}}, {"scheduling": {"same_day_lead_minutes": -1}},
+                    {"scheduling": {"day_penalty_minutes": {"Normal": -5}}},
+                    {"map": {"center": [200, 0]}}, {"map": {"center": [1]}}, {"map": {"center": ["a", "b"]}},
+                    {"map": {"zoom": 40}}):
+            self.assertEqual(a.put("/api/settings", {"settings": bad}).status, 400, bad)
+        # NaN is not valid JSON, but Python's parser accepts it: stored, it would stop the Settings page loading
+        self.assertEqual(a.put("/api/settings", {"settings": {"scheduling": {"travel_speed_mph": float("nan")}}}).status, 400)
+        self.assertEqual(a.put("/api/settings", {"settings": {"scheduling": {"top_n": float("inf")}}}).status, 400)
+        self.assertEqual(a.get("/api/settings").status, 200)
+        self.assertEqual(a.get("/api/dispatch").status, 200)
+        # what the Settings page sends back unchanged is still accepted
+        self.assertEqual(a.put("/api/settings", {"settings": a.get("/api/settings").json()["settings"]}).status, 200)
+
+    def test_technician_flags_must_be_real_booleans_and_days_real_numbers(self):
+        a = self.admin
+        for bad in ({"active": "false"}, {"active": 0}, {"work_days": [True, 2]}):
+            self.assertEqual(a.put("/api/technicians/emp_demo_1", bad).status, 400, bad)
+        r = a.put("/api/technicians/emp_demo_1", {"active": True, "work_days": [0, 1, 2, 3, 4]})
+        self.assertEqual((r.status, r.json()["technician"]["active"]), (200, True))
+
+    def test_durations_must_be_objects_with_a_whole_number_of_minutes(self):
+        a = self.admin
+        before = a.get("/api/settings").json()["durations"]
+        for bad in (["PLB"], [{"trade_code": "PLB", "minutes": "soon"}], [{"trade_code": "PLB"}],
+                    [{"trade_code": "PLB", "minutes": 2}]):
+            r = a.put("/api/settings", {"durations": bad})
+            self.assertEqual(r.status, 400, bad)
+        self.assertEqual(a.get("/api/settings").json()["durations"], before)        # nothing was half-applied
+
     def test_user_management(self):
         a = self.admin
         self.assertEqual(a.post("/api/users", {"email": "bad", "password": "long-enough-pw"}).status, 400)
@@ -523,6 +558,35 @@ class AdminApiTests(ApiBase):
         tmp = next(u for u in users if u["email"] == "temp@example.com")
         self.assertEqual(a.delete(f"/api/users/{tmp['id']}").status, 200)
         self.assertEqual(a.delete("/api/users/9999").status, 404)
+
+
+class LoginLimiterTests(unittest.TestCase):
+    def test_asking_about_a_key_never_creates_an_entry(self):
+        lim = LoginLimiter(max_attempts=3, window=600)
+        for i in range(500):
+            self.assertFalse(lim.blocked(f"acct:{i}@example.com"))
+        self.assertEqual(len(lim._fails), 0)
+
+    def test_the_lockout_still_works_and_expires(self):
+        lim = LoginLimiter(max_attempts=2, window=600)
+        with mock.patch("app.security.time.time", return_value=1000.0):
+            lim.record_failure("k")
+            self.assertFalse(lim.blocked("k"))
+            lim.record_failure("k")
+            self.assertTrue(lim.blocked("k"))
+        with mock.patch("app.security.time.time", return_value=1601.0):
+            self.assertFalse(lim.blocked("k"))
+            self.assertNotIn("k", lim._fails)                  # an expired key is forgotten
+
+    def test_a_flood_of_distinct_keys_is_swept_once_their_failures_have_expired(self):
+        lim = LoginLimiter(max_attempts=2, window=10)
+        lim.MAX_KEYS = 50
+        with mock.patch("app.security.time.time", return_value=0.0):
+            for i in range(50):
+                lim.record_failure(f"ip:10.0.0.{i}")
+        with mock.patch("app.security.time.time", return_value=100.0):
+            lim.record_failure("ip:fresh")
+        self.assertEqual(list(lim._fails), ["ip:fresh"])
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 """Integration tests: HCP (mock) -> sync -> database -> dispatch view / slots. No network."""
+import asyncio
 import copy
 import json
 import os
@@ -7,10 +8,12 @@ import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timezone, date
+from types import SimpleNamespace
 from unittest import mock
 
 from app.config import Config
 from app.db import Database
+from app.main import sync_loop
 from app.domain.warranty_parser import WarrantyJob, parse_warranty_job
 from zoneinfo import ZoneInfo
 
@@ -153,6 +156,93 @@ class SyncTests(unittest.TestCase):
             self.assertEqual(self.e.svc.run(NOW), {"status": "busy"})
         finally:
             self.e.svc._lock.release()
+
+    def test_a_job_hcp_still_lists_is_not_hidden_because_storing_it_failed(self):
+        victim = self.e.hcp.dataset["jobs"][0]["id"]
+        original = self.e.svc._upsert_job
+
+        def flaky(conn, n, settings, now):
+            if n["hcp_job_id"] == victim:
+                raise RuntimeError("database is locked")
+            return original(conn, n, settings, now)
+        self.e.svc._upsert_job = flaky
+        r = self.e.svc.run(NOW)
+        self.assertEqual((r["status"], r["errors"]), ("partial", 1))
+        self.assertEqual(self.e.q("SELECT active FROM jobs WHERE hcp_job_id = ?", victim)[0]["active"], 1)
+
+    def test_a_list_cut_short_at_the_page_cap_hides_nothing_and_the_note_does_not_stick(self):
+        before = len(self.e.q("SELECT 1 FROM jobs WHERE active = 1"))
+        original = self.e.hcp.list_unscheduled
+
+        def cut_short():
+            rows = original()
+            self.e.hcp.truncated = True                      # what HCPClient does when it reaches MAX_PAGES
+            return rows[: len(rows) // 2]
+        self.e.hcp.list_unscheduled = cut_short
+        self.e.svc.run(NOW)
+        self.assertEqual(len(self.e.q("SELECT 1 FROM jobs WHERE active = 1")), before)      # the missing half is not hidden
+        self.assertIn("page cap", self.e.q("SELECT error FROM sync_runs ORDER BY id DESC LIMIT 1")[0]["error"])
+        self.e.hcp.list_unscheduled = original
+        self.assertEqual(self.e.svc.run(NOW)["status"], "ok")
+        self.assertIsNone(self.e.q("SELECT error FROM sync_runs ORDER BY id DESC LIMIT 1")[0]["error"])   # flag was reset
+
+    def test_someone_saving_while_the_geocoder_is_slow_does_not_make_the_job_fail(self):
+        env = Env()
+        try:
+            class Slow:
+                name, calls = "slow", 0
+
+                def geocode(inner, address):
+                    inner.calls += 1
+                    with env.db.session() as c:          # a dispatcher saves something while the sync waits on the geocoder
+                        c.execute("INSERT OR REPLACE INTO settings(key, value) VALUES ('other', ?)", (str(inner.calls),))
+                    return MockGeocoder().geocode(address)
+            slow = Slow()
+            svc = SyncService(env.db, env.cfg, env.hcp, slow, new_tech_defaults=None)
+            r = svc.run(NOW)
+            self.assertGreater(slow.calls, 5)
+            self.assertEqual((r["status"], r["errors"]), ("ok", 0))
+            self.assertEqual(r["jobs_seen"], len(env.hcp.dataset["jobs"]))
+        finally:
+            env.close()
+
+    def test_an_unexpected_failure_ends_the_run_as_an_error_and_the_next_run_starts_clean(self):
+        def boom(conn, employees):
+            raise RuntimeError("disk I/O error")
+        self.e.svc._sync_employees = boom
+        r = self.e.svc.run(NOW)
+        self.assertEqual(r["status"], "error")
+        last = self.e.q("SELECT status, finished_at FROM sync_runs ORDER BY id DESC LIMIT 1")[0]
+        self.assertEqual(last["status"], "error")                       # not left 'running' for ever
+        self.assertIsNotNone(last["finished_at"])
+        del self.e.svc._sync_employees
+        self.assertEqual(self.e.svc.run(NOW)["status"], "ok")
+
+
+class SyncLoopTests(unittest.TestCase):
+    def test_one_crashed_run_does_not_stop_the_runs_after_it(self):
+        runs = []
+
+        class Crashing:
+            def run(self):
+                runs.append(1)
+                raise RuntimeError("boom")
+        app = SimpleNamespace(state=SimpleNamespace(cfg=Config(sync_on_startup=True), sync=Crashing()))
+        real_sleep = asyncio.sleep
+
+        async def drive():
+            async def quick(_seconds):
+                await real_sleep(0)
+            with mock.patch("app.main.asyncio.sleep", quick):
+                task = asyncio.create_task(sync_loop(app))
+                await real_sleep(0.3)
+                still_running = not task.done()
+                task.cancel()
+            with self.assertRaises(asyncio.CancelledError):             # cancelling still stops it cleanly
+                await task
+            return still_running
+        self.assertTrue(asyncio.run(drive()))
+        self.assertGreater(len(runs), 2)
 
 
 class DispatchViewTests(unittest.TestCase):
@@ -789,6 +879,18 @@ class NormalizeTests(unittest.TestCase):
         for raw in ({}, {"id": "x", "address": "123 Main", "customer": None, "schedule": "soon", "tags": None}):
             self.assertIsInstance(normalize_job(raw), dict)
 
+    def test_coordinates_that_cannot_be_right_are_ignored_so_the_address_is_geocoded_instead(self):
+        def coords(lat, lng):
+            n = normalize_job({"id": "c", "address": {"street": "1 A St", "latitude": lat, "longitude": lng}})
+            return n["hcp_lat"], n["hcp_lng"]
+        self.assertEqual(coords(33.3, -111.8), (33.3, -111.8))
+        self.assertEqual(coords("33.3", "-111.8"), (33.3, -111.8))
+        self.assertEqual(coords(0, 0), (None, None))                    # how a missing location is often stored
+        self.assertEqual(coords("0", "0.0"), (None, None))
+        self.assertEqual(coords(0, -111.8), (0.0, -111.8))              # only the exact pair 0, 0 is suspect
+        for bad in ((float("nan"), 1.0), (95.0, 10.0), (10.0, 190.0), (33.3, None), (None, None), ("north", "west")):
+            self.assertEqual(coords(*bad), (None, None), bad)
+
     def test_status_and_employee_helpers(self):
         self.assertEqual(canonical_work_status("in progress"), "in_progress")
         self.assertEqual(canonical_work_status("complete rated"), "complete")
@@ -855,6 +957,13 @@ class AIFallbackTests(unittest.TestCase):
         sent = json.dumps(t.sent)
         self.assertNotIn("JANE SAMPLE", sent)
         self.assertNotIn("4805550101", sent)
+
+    def test_street_names_the_ai_returns_are_capitalised_like_the_parsers(self):
+        desc = build_ahs_description(include_address=False)
+        job = parse_warranty_job(desc)
+        t = self.Fake('{"street": "1425 W 5TH AVE", "city": "mesa", "state": "az", "zip_code": "85201"}')
+        self.assertTrue(ai_fallback.ai_fill(self.cfg(), desc, job, t))
+        self.assertEqual(job.full_address, "1425 W 5th Ave, Mesa, AZ 85201")
 
     def test_disabled_without_key_or_when_nothing_missing(self):
         desc = build_ahs_description(include_address=False)

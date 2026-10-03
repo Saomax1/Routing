@@ -7,9 +7,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+import urllib.request
 from datetime import date, datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 from zoneinfo import ZoneInfo
 
 from app.config import Config
@@ -17,7 +21,7 @@ from app.db import Database
 from app.domain.travel import HaversineTravel
 from app.hcp.client import HCPClient, MockHCPClient
 from app.hcp.fixtures import DEMO_TECH_SETUP
-from app.hcp.http import HttpError, ReadOnlyTransport, ReadOnlyViolation, UrllibTransport
+from app.hcp.http import HttpError, ReadOnlyTransport, ReadOnlyViolation, UrllibTransport, _SameHostRedirects
 from app.main import create_app
 from app.services.data_mode import count_demo, count_real, has_real_data, purge_demo_data
 from app.services.geocode import MockGeocoder
@@ -302,6 +306,122 @@ class EnvFileTests(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), [".env"])
         if os.name == "posix":
             self.assertEqual(self.env.stat().st_mode & 0o077, 0)
+
+    @unittest.skipUnless(os.name == "posix", "file permissions")
+    def test_the_key_is_never_in_a_file_other_users_can_read_not_even_briefly(self):
+        leftover = self.tmp / ".env.tmp"                       # what an interrupted earlier run can leave behind
+        leftover.write_text("stale", encoding="utf-8")
+        os.chmod(leftover, 0o644)
+        modes, real_replace = [], os.replace
+
+        def spy(src, dst):
+            modes.append(os.stat(src).st_mode & 0o777)         # the file as it was while it held the key
+            return real_replace(src, dst)
+        # chmod is switched off so the mode seen is the one the file was CREATED with, not one fixed up afterwards
+        with mock.patch("app.services.live_setup.os.replace", spy), mock.patch("app.services.live_setup.os.chmod"):
+            update_env_file(self.env, {"HCP_API_KEY": "secret"})
+        self.assertEqual(modes, [0o600])
+
+
+class _Server:
+    """A throwaway local web server: ``routes`` maps a path to ('redirect', url) or ('json', object / raw bytes), and
+    every GET it receives is recorded with the credentials that came with it."""
+
+    def __init__(self, routes):
+        self.routes, self.hits, outer = routes, [], self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                outer.hits.append({"path": self.path, "authorization": self.headers.get("Authorization"),
+                                   "x-api-key": self.headers.get("x-api-key")})
+                kind, value = outer.routes.get(self.path, ("json", {}))
+                if kind == "redirect":
+                    self.send_response(302)
+                    self.send_header("Location", value)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                body = value if isinstance(value, bytes) else json.dumps(value).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        threading.Thread(target=self.httpd.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
+
+    def stop(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+class TransportSafetyTests(unittest.TestCase):
+    CREDENTIALS = {"Authorization": f"Token {KEY}", "x-api-key": "another-secret"}
+
+    def setUp(self):
+        self.far = _Server({"/landed": ("json", {"ok": True})})
+        self.near = _Server({})
+        self.near.routes = {"/same": ("redirect", self.near.url + "/landed"), "/landed": ("json", {"ok": True}),
+                            "/away": ("redirect", self.far.url + "/landed"), "/html": ("json", b"<html>Sign in</html>")}
+        self.t = UrllibTransport(max_attempts=3, sleep=lambda s: None)
+
+    def tearDown(self):
+        self.near.stop()
+        self.far.stop()
+
+    def test_a_redirect_within_the_same_server_keeps_the_credentials(self):
+        self.assertEqual(self.t.request("GET", self.near.url + "/same", headers=self.CREDENTIALS), {"ok": True})
+        landed = self.near.hits[-1]
+        self.assertEqual((landed["path"], landed["authorization"], landed["x-api-key"]),
+                         ("/landed", f"Token {KEY}", "another-secret"))
+
+    def test_a_redirect_to_another_server_never_carries_the_credentials_along(self):
+        self.assertEqual(self.t.request("GET", self.near.url + "/away", headers=self.CREDENTIALS), {"ok": True})
+        self.assertEqual(self.near.hits[0]["authorization"], f"Token {KEY}")      # the server we meant to talk to
+        landed = self.far.hits[-1]
+        self.assertEqual(landed["path"], "/landed")                                # the redirect itself still works
+        self.assertEqual((landed["authorization"], landed["x-api-key"]), (None, None))
+
+    def test_dropping_from_https_to_http_on_the_same_host_also_drops_the_credentials(self):
+        handler = _SameHostRedirects()
+        req = urllib.request.Request("https://api.example.test/jobs", headers=self.CREDENTIALS)
+
+        def carried(url):
+            new = handler.redirect_request(req, None, 302, "Found", {}, url)
+            return {k.lower() for k in new.headers} & {"authorization", "x-api-key"}
+        self.assertEqual(carried("http://api.example.test/jobs"), set())                  # downgrade: dropped
+        self.assertEqual(carried("https://api.example.test:8443/jobs"), set())            # another port: dropped
+        self.assertEqual(carried("https://other.example.test/jobs"), set())               # another host: dropped
+        self.assertEqual(carried("https://API.example.test/elsewhere"), {"authorization", "x-api-key"})   # same origin
+
+    def test_an_answer_that_is_not_json_is_a_clear_error_not_a_retry_storm(self):
+        with self.assertRaises(HttpError) as ctx:
+            self.t.request("GET", self.near.url + "/html")
+        self.assertIn("not JSON", str(ctx.exception))
+        self.assertNotIn("Sign in", str(ctx.exception))                            # nothing from the page is echoed
+        self.assertEqual(len([h for h in self.near.hits if h["path"] == "/html"]), 1)
+
+
+class PageCapTests(unittest.TestCase):
+    def test_reaching_the_page_cap_is_flagged_for_that_run_only_and_hides_no_job(self):
+        env = LiveEnv(page_size=2)
+        try:
+            self.assertEqual(env.live_sync()["status"], "ok")
+            active = env.q("SELECT COUNT(*) n FROM jobs WHERE active = 1")[0]["n"]
+            self.assertGreater(active, 4)
+            svc = SyncService(env.db, env.cfg, env.client(), MockGeocoder(), new_tech_defaults=None)   # one client throughout
+            with mock.patch("app.hcp.client.MAX_PAGES", 1):                         # two jobs per list, then it stops
+                capped = svc.run(NOW)
+            self.assertEqual(env.q("SELECT COUNT(*) n FROM jobs WHERE active = 1")[0]["n"], active)
+            self.assertIn("page cap", env.q("SELECT error FROM sync_runs ORDER BY id DESC LIMIT 1")[0]["error"])
+            self.assertLess(capped["jobs_seen"], active)
+            self.assertEqual(svc.run(NOW)["status"], "ok")                          # the next full run is clean again
+            self.assertIsNone(env.q("SELECT error FROM sync_runs ORDER BY id DESC LIMIT 1")[0]["error"])
+        finally:
+            env.close()
 
 
 class Script:

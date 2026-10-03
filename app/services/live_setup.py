@@ -49,11 +49,15 @@ def update_env_file(path: Path, values: Dict[str, str], template: Optional[Path]
         else:
             lines.append(new)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
     try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass                                   # not supported on every system (Windows)
+        tmp.unlink()                           # a leftover from an interrupted run may have looser permissions
+    except FileNotFoundError:
+        pass
+    # created owner-only from the start: the key must never sit in a file other users can read, not even briefly
+    # (the mode is ignored on Windows, which has no such permissions)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
     os.replace(tmp, path)
 
 

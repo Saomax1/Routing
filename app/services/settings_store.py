@@ -13,6 +13,7 @@ everything else is Retail (``domain/jobkind.py``). The tag texts are editable he
 from __future__ import annotations
 
 import copy
+import math
 from typing import Any
 
 from ..db import jdump, jload
@@ -81,6 +82,14 @@ DEFAULT_SETTINGS: dict = {
 }
 
 
+# Allowed range of each slot-finder number: outside it the finder returns nothing, or nonsense.
+SCHEDULING_LIMITS = {
+    "search_days": (1, 14), "top_n": (1, 50), "default_duration_minutes": (5, 720), "round_to_minutes": (1, 60),
+    "travel_speed_mph": (5, 100), "travel_circuity": (1, 3), "min_travel_minutes": (0, 60),
+    "same_day_lead_minutes": (0, 720), "deadline_miss_penalty": (0, 10000),
+    "window_minutes": (15, 720), "window_step_minutes": (5, 240), "stack_within_minutes": (0, 120),
+}
+
 # Free-form maps that users add to and remove from. A saved copy replaces the default instead of merging into it,
 # otherwise a rule removed in Admin > Settings would come back from the defaults on the next read.
 FREE_FORM_MAPS = ("deadline_rules", "trade_aliases")
@@ -101,7 +110,9 @@ def _check(default: Any, value: Any, path: str) -> None:
     if isinstance(default, bool):
         ok = isinstance(value, bool)
     elif isinstance(default, (int, float)):
-        ok = isinstance(value, (int, float)) and not isinstance(value, bool)
+        # NaN / Infinity are accepted by the JSON parser, but a stored one cannot be sent back to the browser: the
+        # Settings page would no longer load
+        ok = isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
     elif isinstance(default, str):
         ok = isinstance(value, str)
     elif isinstance(default, list):
@@ -139,12 +150,27 @@ def validate_settings(patch: dict) -> None:
     if group_by is not None and group_by not in GROUP_BY:
         raise ValueError(f"Area grouping must be one of: {', '.join(GROUP_BY)}")
     sched = patch.get("scheduling") or {}
-    for key, lo, hi in (("window_minutes", 15, 720), ("window_step_minutes", 5, 240), ("stack_within_minutes", 0, 120)):
+    for key, (lo, hi) in SCHEDULING_LIMITS.items():
         if key in sched and not lo <= sched[key] <= hi:
             raise ValueError(f"scheduling.{key} must be between {lo} and {hi}")
-    tile = (patch.get("map") or {}).get("tile_url")
+    for prio, minutes in (sched.get("day_penalty_minutes") or {}).items():
+        if minutes < 0:
+            raise ValueError(f"The delay penalty for {prio} cannot be negative")
+    if "urgency_keywords" in patch:
+        words = patch["urgency_keywords"]
+        if len(words) > 200 or not all(isinstance(w, str) and 0 < len(w.strip()) <= 80 for w in words):
+            raise ValueError("Urgency keywords must be up to 200 words or phrases of 80 characters or fewer")
+    map_cfg = patch.get("map") or {}
+    tile = map_cfg.get("tile_url")
     if tile and not str(tile).startswith("https://"):
         raise ValueError("Map tile URL must start with https://")
+    if "center" in map_cfg:
+        c = map_cfg["center"]
+        if not (len(c) == 2 and all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in c)
+                and -90 <= c[0] <= 90 and -180 <= c[1] <= 180):
+            raise ValueError("Map center must be [latitude, longitude]")
+    if "zoom" in map_cfg and not 3 <= map_cfg["zoom"] <= 18:
+        raise ValueError("Map zoom must be between 3 and 18")
     for company, rules in (patch.get("deadline_rules") or {}).items():
         if not isinstance(rules, dict):
             raise ValueError(f"Deadline rules for {company} must be an object of priority -> hours")
@@ -226,9 +252,14 @@ def get_durations(conn) -> list:
 def replace_durations(conn, items: list) -> list:
     clean = []
     for it in items:
+        if not isinstance(it, dict):
+            raise ValueError("Each duration needs trade_code, keyword and minutes")
         trade = str(it.get("trade_code") or "*").strip().upper() or "*"
         kw = str(it.get("keyword") or "").strip().lower()
-        mins = int(it.get("minutes"))
+        try:
+            mins = int(it.get("minutes"))
+        except (TypeError, ValueError):
+            raise ValueError("Duration minutes must be a whole number between 5 and 720") from None
         if not 5 <= mins <= 12 * 60:
             raise ValueError("Duration minutes must be between 5 and 720")
         clean.append((trade, kw, mins))

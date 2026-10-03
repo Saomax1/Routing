@@ -48,15 +48,23 @@ def burn_verify(password: str) -> None:
 class LoginLimiter:
     """Allow at most ``max_attempts`` failed logins per key within ``window`` seconds."""
 
+    MAX_KEYS = 10_000
+
     def __init__(self, max_attempts: int = 5, window: int = 600):
         self.max_attempts, self.window = max_attempts, window
         self._fails = defaultdict(deque)
         self._lock = threading.Lock()
 
     def _prune(self, key: str, now: float) -> deque:
-        q = self._fails[key]
+        """The recent failures for ``key``. A key with none left is forgotten, and merely asking about a key never
+        creates an entry, so a flood of different emails or addresses cannot grow this table."""
+        q = self._fails.get(key)
+        if q is None:
+            return deque()
         while q and now - q[0] > self.window:
             q.popleft()
+        if not q:
+            del self._fails[key]
         return q
 
     def blocked(self, key: str) -> bool:
@@ -66,7 +74,11 @@ class LoginLimiter:
     def record_failure(self, key: str) -> None:
         with self._lock:
             now = time.time()
-            self._prune(key, now).append(now)
+            if len(self._fails) >= self.MAX_KEYS:        # forget every key whose failures have all expired
+                for k in [k for k, q in self._fails.items() if not q or now - q[-1] > self.window]:
+                    del self._fails[k]
+            self._prune(key, now)
+            self._fails[key].append(now)
 
     def reset(self, key: str) -> None:
         with self._lock:

@@ -40,8 +40,10 @@ touches real data).
 python -m unittest discover -s tests -t .
 ```
 
-330 tests cover the warranty parser, private-notes handling, scoring, travel and slot engines, arrival windows, completed jobs, deadline
-exceptions, area totals, slot confirmation, road routing, the sync pipeline, the read-only live connection (checked over real HTTP against a stand-in Housecall Pro server), the go-live and live-check scripts, and the API (auth, roles, CSRF, rate limiting). All fixtures are sanitized fake data. The suite uses
+416 tests cover the warranty parser, private-notes handling, scoring, travel and slot engines, arrival windows, completed jobs, deadline
+exceptions, area totals, slot confirmation, road routing, the sync pipeline (including failed jobs, a list cut short at the page cap and
+a dispatcher saving while a sync waits on the geocoder), the read-only live connection (checked over real HTTP against a stand-in Housecall Pro server, including redirects and
+non-JSON answers), the go-live and live-check scripts, and the API (auth, roles, CSRF, rate limiting, settings validation). All fixtures are sanitized fake data. The suite uses
 only the standard library `unittest`.
 
 ## Connecting to your real Housecall Pro account (read-only)
@@ -233,7 +235,11 @@ See [`.env.example`](.env.example) for the full annotated list. The important on
   Areas tab still rank with straight-line estimates, so a slot card's "+4 min driving" can differ from the road time
   on the line.
 - **Sync** (`app/services/sync.py`): pulls from HCP, geocodes with a cache, deduplicates by description hash, and
-  deactivates open jobs that HCP no longer returns (completed jobs are history and stay).
+  deactivates open jobs that HCP no longer returns (completed jobs are history and stay). Each job is stored in its own
+  transaction, so one bad record costs only itself. Nothing is deactivated for a job HCP did return but that failed to
+  store, nor when a list was cut short at the page cap (the run says so), and an unexpected failure ends the run as
+  `error` instead of leaving it `running` or stopping the background loop. Coordinates from HCP are used only when they
+  are real (a `0, 0` or out-of-range location is ignored and the address is geocoded instead).
 
 ## Security notes
 
@@ -252,7 +258,9 @@ See [`.env.example`](.env.example) for the full annotated list. The important on
 - The HCP client is read-only by construction: its transport refuses everything but `GET` (and a `GET` with a body), the
   write methods that exist raise `NotImplementedError`, and a test fails if the client ever gains a public method that is
   not a plain read. The API key is sent only to Housecall Pro, in the `Authorization` header (never in a URL), and
-  `scripts/go_live.py` reads it hidden and writes it only to `.env`. Confirming a slot saves the
+  `scripts/go_live.py` reads it hidden and writes it only to `.env` (a file created owner-only from the start). If a
+  server ever answers a request with a redirect to a different host, port or scheme (https to http), the key and other
+  credentials are dropped from the redirected request (the Python standard library would copy them). Confirming a slot saves the
   booking in this app's database only. Phase 2 write-back must only run on an explicit dispatcher action with a
   confirmation step: the confirm box and the server-side re-check are that step.
 

@@ -18,7 +18,7 @@ import re
 from typing import Optional
 
 from ..config import Config
-from ..domain.warranty_parser import PRIORITY_RANK, WarrantyJob, missing_key_fields
+from ..domain.warranty_parser import PRIORITY_RANK, WarrantyJob, missing_key_fields, title_case
 from ..hcp.http import UrllibTransport
 
 log = logging.getLogger("routing.ai")
@@ -78,7 +78,7 @@ def apply_ai_fields(job: WarrantyJob, data: dict) -> list:
                             ("state", "state", r"[A-Za-z]{2}"), ("zip_code", "zip_code", r"\d{5}(-\d{4})?")):
         v = s(data.get(key))
         if v and not getattr(job, field) and (pat is None or re.fullmatch(pat, v)):
-            setattr(job, field, v.title() if field in ("street", "city") else v.upper())
+            setattr(job, field, title_case(v) if field in ("street", "city") else v.upper())
             if "address" not in filled:
                 filled.append("address")
     if job.street and job.city and job.state and job.zip_code and not job.full_address:

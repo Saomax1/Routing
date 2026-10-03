@@ -3,7 +3,7 @@ import os
 import unittest
 
 from app.domain.warranty_parser import (
-    find_urgency_flags, looks_like_warranty, missing_key_fields, parse_warranty_job,
+    find_urgency_flags, looks_like_warranty, missing_key_fields, parse_warranty_job, title_case,
 )
 from app.hcp.fixtures import build_ahs_description
 
@@ -164,6 +164,14 @@ class RobustnessTests(unittest.TestCase):
     def test_contract_contact_fallback(self):
         text = build_ahs_description().replace("(Dispatch Contact)", "(Someone)")
         self.assertEqual(parse_warranty_job(text).contact_name, "Jane Sample")
+
+    def test_ordinal_street_names_and_apostrophes_are_not_mangled(self):
+        j = parse_warranty_job(build_ahs_description(street="1425 W 5TH AVE", city="MARTIN'S LANDING"))
+        self.assertEqual((j.street, j.city), ("1425 W 5th Ave", "Martin's Landing"))
+        self.assertEqual(j.full_address, "1425 W 5th Ave, Martin's Landing, AZ 85226")
+        for raw, want in (("2ND ST", "2nd St"), ("21ST AVE", "21st Ave"), ("33RD PL", "33rd Pl"), ("123 W MAIN ST", "123 W Main St"),
+                          ("40 N 1ST ST APT 4B", "40 N 1st St Apt 4B"), ("77 E O'NEIL RD", "77 E O'Neil Rd")):
+            self.assertEqual(title_case(raw), want)
 
 
 if __name__ == "__main__":

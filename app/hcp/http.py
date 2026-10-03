@@ -9,9 +9,9 @@ Tiny JSON-over-HTTPS transport (stdlib only) with retry + exponential backoff.
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
-import socket
 import time
 import urllib.error
 import urllib.parse
@@ -19,6 +19,8 @@ import urllib.request
 from typing import Any, Callable, Optional
 
 log = logging.getLogger("routing.http")
+
+_CREDENTIAL_HEADERS = ("authorization", "proxy-authorization", "x-api-key", "cookie")
 
 
 class HttpError(Exception):
@@ -47,10 +49,30 @@ class ReadOnlyTransport:
         return self.inner.request("GET", url, headers=headers, params=params, **kw)
 
 
+def _origin(url: str) -> tuple:
+    parts = urllib.parse.urlsplit(url)
+    return parts.scheme.lower(), parts.netloc.lower()
+
+
+class _SameHostRedirects(urllib.request.HTTPRedirectHandler):
+    """urllib copies every header, Authorization included, onto a redirected request, even when it goes to another
+    host (or drops from https to http). A key must only ever reach the server it was meant for, so credentials are
+    dropped whenever a redirect leaves the original scheme, host and port, as browsers do."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and _origin(req.full_url) != _origin(new.full_url):
+            for store in (new.headers, new.unredirected_hdrs):
+                for name in [k for k in store if k.lower() in _CREDENTIAL_HEADERS]:
+                    del store[name]
+        return new
+
+
 class UrllibTransport:
     def __init__(self, timeout: float = 30.0, max_attempts: int = 5, base_delay: float = 1.0,
                  sleep: Callable[[float], None] = time.sleep):
         self.timeout, self.max_attempts, self.base_delay, self._sleep = timeout, max_attempts, base_delay, sleep
+        self._opener = urllib.request.build_opener(_SameHostRedirects())     # same proxy / TLS defaults as urlopen
 
     def request(self, method: str, url: str, headers: Optional[dict] = None, params: Optional[list] = None,
                 json_body: Any = None, label: Optional[str] = None) -> Any:
@@ -68,9 +90,14 @@ class UrllibTransport:
         for attempt in range(1, self.max_attempts + 1):
             req = urllib.request.Request(full, data=data, headers=hdrs, method=method)
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                with self._opener.open(req, timeout=self.timeout) as resp:
                     body = resp.read()
-                    return json.loads(body) if body else None
+                if not body:
+                    return None
+                try:
+                    return json.loads(body)
+                except ValueError:       # an HTML page from a proxy or captive portal, say
+                    raise HttpError(0, path, "the answer was not JSON") from None
             except urllib.error.HTTPError as e:
                 if e.code in (429, 500, 502, 503, 504) and attempt < self.max_attempts:
                     delay = self._retry_after(e) or self.base_delay * (2 ** (attempt - 1))
@@ -79,7 +106,7 @@ class UrllibTransport:
                     last = HttpError(e.code, path)
                     continue
                 raise HttpError(e.code, path) from None
-            except (urllib.error.URLError, socket.timeout, ConnectionError) as e:
+            except (urllib.error.URLError, OSError, http.client.HTTPException) as e:   # timeouts, resets, short reads
                 last = HttpError(0, path, type(e).__name__)
                 if attempt < self.max_attempts:
                     self._sleep(self.base_delay * (2 ** (attempt - 1)))

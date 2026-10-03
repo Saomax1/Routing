@@ -95,6 +95,12 @@ def _find(pattern: str, text: str, flags: int = re.IGNORECASE) -> Optional[str]:
     return m.group(1).strip() if m else None
 
 
+def title_case(text: str) -> str:
+    """str.title() for street and city names, minus its two mistakes: '5th Ave' -> '5Th Ave', "Martin's" -> "Martin'S"."""
+    t = re.sub(r"(?<=\d)(St|Nd|Rd|Th)\b", lambda m: m.group(1).lower(), text.title())
+    return re.sub(r"(?<=[A-Za-z])'S\b", "'s", t)
+
+
 def _money(value: Optional[str]) -> Optional[float]:
     if not value:
         return None
@@ -215,11 +221,11 @@ def parse_warranty_job(raw: str) -> WarrantyJob:
     if addr_block:
         lines = [ln.strip() for ln in addr_block.strip().splitlines() if ln.strip()]
         if lines:
-            job.street = lines[0].title()
+            job.street = title_case(lines[0])
         if len(lines) >= 2:
             m = re.match(r"(.+?),\s*([A-Za-z]{2})\s+(\d{5}(?:-\d{4})?)", lines[1])
             if m:
-                job.city, job.state, job.zip_code = m.group(1).title(), m.group(2).upper(), m.group(3)
+                job.city, job.state, job.zip_code = title_case(m.group(1)), m.group(2).upper(), m.group(3)
         if job.street and job.city and job.state and job.zip_code:
             job.full_address = f"{job.street}, {job.city}, {job.state} {job.zip_code}"
         elif job.street:

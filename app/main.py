@@ -93,18 +93,20 @@ def bootstrap_users(db: Database, cfg: Config) -> Optional[str]:
             "in .env to choose your own)") if generated else f"Admin account created for {email}"
 
 
+async def _sync_once(app: Starlette) -> None:
+    try:
+        await asyncio.to_thread(app.state.sync.run)
+    except Exception as e:  # one failed run must never stop the runs after it (cancellation is not an Exception)
+        log.error("sync run crashed: %s", type(e).__name__)
+
+
 async def sync_loop(app: Starlette) -> None:
     cfg: Config = app.state.cfg
-    try:
-        if cfg.sync_on_startup:
-            await asyncio.to_thread(app.state.sync.run)
-        while True:
-            await asyncio.sleep(max(30, cfg.sync_interval_seconds))
-            await asyncio.to_thread(app.state.sync.run)
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:  # keep the app alive no matter what
-        log.error("sync loop crashed: %s", type(e).__name__)
+    if cfg.sync_on_startup:
+        await _sync_once(app)
+    while True:
+        await asyncio.sleep(max(30, cfg.sync_interval_seconds))
+        await _sync_once(app)
 
 
 def create_app(cfg: Optional[Config] = None, hcp=None, geocoder=None, background_sync: bool = True,

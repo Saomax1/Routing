@@ -10,6 +10,7 @@ Turn raw Housecall Pro API objects into the flat records this app stores.
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Any, Optional
 
@@ -30,6 +31,20 @@ def pick(d: Any, *paths: str, default=None):
         if cur not in (None, "", [], {}):
             return cur
     return default
+
+
+def _coordinates(lat: Any, lng: Any):
+    """(lat, lng) as floats, or (None, None) when HCP gave nothing usable. 0, 0 is how a missing location is often
+    stored; taking it at face value would pin the job in the Gulf of Guinea instead of geocoding its address."""
+    try:
+        lat, lng = float(lat), float(lng)
+    except (TypeError, ValueError):
+        return None, None
+    if not (math.isfinite(lat) and math.isfinite(lng) and -90 <= lat <= 90 and -180 <= lng <= 180):
+        return None, None
+    if lat == 0 and lng == 0:
+        return None, None
+    return lat, lng
 
 
 def _name_of(v: Any) -> str:
@@ -140,13 +155,7 @@ def normalize_job(raw: dict) -> dict:
         if n:
             tags.append(n)
 
-    lat = pick(addr, "latitude", "lat")
-    lng = pick(addr, "longitude", "lng", "lon")
-    try:
-        lat = float(lat) if lat is not None else None
-        lng = float(lng) if lng is not None else None
-    except (TypeError, ValueError):
-        lat = lng = None
+    lat, lng = _coordinates(pick(addr, "latitude", "lat"), pick(addr, "longitude", "lng", "lon"))
 
     # arrival_window = minutes after scheduled_start in which the technician may arrive (the promise to the customer)
     window = pick(raw, "schedule.arrival_window", "schedule.arrival_window_minutes", "arrival_window")
