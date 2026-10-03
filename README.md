@@ -40,7 +40,7 @@ touches real data).
 python -m unittest discover -s tests -t .
 ```
 
-314 tests cover the warranty parser, scoring, travel and slot engines, arrival windows, completed jobs, deadline
+330 tests cover the warranty parser, private-notes handling, scoring, travel and slot engines, arrival windows, completed jobs, deadline
 exceptions, area totals, slot confirmation, road routing, the sync pipeline, the read-only live connection (checked over real HTTP against a stand-in Housecall Pro server), the go-live and live-check scripts, and the API (auth, roles, CSRF, rate limiting). All fixtures are sanitized fake data. The suite uses
 only the standard library `unittest`.
 
@@ -120,6 +120,15 @@ See [`.env.example`](.env.example) for the full annotated list. The important on
 
 ## How it works
 
+- **Warranty text in private notes** (`app/hcp/normalize.py`): warranty companies' dispatch text is often pasted into a job's
+  *private notes* rather than its description, so the app reads both: the job description, plus any note that looks like a
+  warranty dispatch (`Dispatch Priority:`, `Covered Property Address`, a `xxx:12345` dispatch line, ...). **Every other note is
+  dropped before anything is stored, shown or logged**: a gate code, a remark about the customer or a payment note never
+  reaches the database, the job card, the logs or the optional AI fallback. Notes are read from the job record
+  (`notes`, also `private_notes` / `internal_notes` / `job_notes`; text, a list of strings or a list of `{content|text|note|body}`).
+  This is still read-only: it is the same `GET /jobs` as before. Whether Housecall Pro includes private notes in the job list
+  for your key is up to Housecall Pro: `python scripts/phase0_probe.py` (step 4) tells you how many of your jobs came back
+  with notes and where the dispatch text was found, and `scripts/live_check.py` warns if no warranty text is found at all.
 - **Warranty parser** (`app/domain/warranty_parser.py`): reads AHS / Frontdoor descriptions into dispatch priority, trade,
   items, authorization limits, address and contact. Priority comes from the `Dispatch Priority:` line in the body, not the
   header. Anything the regex cannot read is flagged in *Parse review*, where a dispatcher can fix it and mark it reviewed.

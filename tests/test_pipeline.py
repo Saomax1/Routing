@@ -764,7 +764,7 @@ class NormalizeTests(unittest.TestCase):
                            "lead_source": {"name": "Yelp"}, "job_type": {"name": "Plumbing"}})
         self.assertEqual(n["hcp_job_id"], "77")
         self.assertEqual(n["work_status"], "unscheduled")
-        self.assertEqual(n["description_raw"], "line one\nline two")
+        self.assertEqual(n["description_raw"], "")                   # ordinary private notes are not read at all
         self.assertEqual(n["customer_name"], "Acme Co")
         self.assertEqual((n["hcp_lat"], n["hcp_lng"]), (33.3, -111.8))
         self.assertEqual(n["assigned_employee_ids"], ["e1"])

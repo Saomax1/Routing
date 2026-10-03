@@ -37,7 +37,7 @@ from app.domain.warranty_parser import looks_like_warranty, missing_key_fields, 
 from app.hcp.client import HCPClient, MockHCPClient  # noqa: E402
 from app.hcp.diagnose import explain_http_error  # noqa: E402
 from app.hcp.http import HttpError  # noqa: E402
-from app.hcp.normalize import normalize_job  # noqa: E402
+from app.hcp.normalize import normalize_job, note_texts, warranty_notes  # noqa: E402
 from app.services.ai_fallback import redact  # noqa: E402
 
 
@@ -144,6 +144,17 @@ def run_probe(client, limit=20, show_failures=False, tz=ZoneInfo("America/Phoeni
         printer("work_status values among scheduled jobs:", dict(open_statuses), "  (scheduled and in progress are expected)")
 
     step("4. Where does the warranty text live?")
+    jobs_seen = unscheduled + scheduled
+    with_notes = sum(1 for j in jobs_seen if note_texts(j))
+    in_notes = sum(1 for j in jobs_seen if warranty_notes(j))
+    in_description = sum(1 for j in jobs_seen if looks_like_warranty(str(j.get("description") or "")))
+    report["private_notes"] = {"jobs": len(jobs_seen), "with_notes": with_notes, "warranty_in_notes": in_notes,
+                               "warranty_in_description": in_description}
+    printer(f"{with_notes} of {len(jobs_seen)} jobs came back with notes; {in_notes} have a warranty dispatch in their "
+            f"notes and {in_description} in their description. (Notes that are not warranty text are never read or kept.)")
+    if jobs_seen and not with_notes:
+        printer("-> No job came back with a notes field. If your warranty dispatches are in Housecall Pro's PRIVATE NOTES, the "
+                "job list is not returning them (a separate request per job may be needed): please share this report.")
     where = Counter()
     for j in unscheduled + scheduled:
         for path, s in text_fields(j):
@@ -152,8 +163,8 @@ def run_probe(client, limit=20, show_failures=False, tz=ZoneInfo("America/Phoeni
     report["warranty_text_fields"] = dict(where)
     if where:
         printer("fields containing warranty-looking text:", dict(where))
-        printer("-> the app reads 'description' (then job_description/summary/notes). If the text is elsewhere, "
-                "edit normalize_job() in app/hcp/normalize.py.")
+        printer("-> the app reads the job 'description' plus any note that looks like a warranty dispatch. If the text is "
+                "elsewhere, edit normalize_job() in app/hcp/normalize.py.")
     else:
         printer("No warranty-looking text found in any field. Either there are no warranty jobs right now, or the text lives "
                 "in a field that was not returned.")

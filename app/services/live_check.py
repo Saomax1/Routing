@@ -64,6 +64,9 @@ def _median(xs):
     return statistics.median(xs) if xs else None
 
 
+CHECK_DAYS = 7           # look a week ahead: a check run on a Friday evening or a weekend must still reach Monday
+
+
 def run_live_check(db, cfg, hcp, geocoder, routes, now: Optional[datetime] = None, do_sync: bool = True,
                    jobs: int = 5, days: Optional[int] = None, legs: int = 12,
                    printer: Callable[..., None] = print) -> dict:
@@ -125,6 +128,10 @@ def run_live_check(db, cfg, hcp, geocoder, routes, now: Optional[datetime] = Non
         warranty = conn.execute("SELECT COUNT(*) FROM warranty_details w JOIN jobs j USING (hcp_job_id) WHERE j.active = 1").fetchone()[0]
         report["jobs"]["warranty_parsed"] = warranty
         printer(f"  warranty descriptions recognised: {warranty}")
+        if sum(status.values()) >= 5 and warranty == 0:
+            verdict("WARN", "No job contains warranty dispatch text. If you take warranty jobs, the text may be somewhere the app is "
+                            "not reading (it reads the job description and any note that looks like a dispatch): run "
+                            "python scripts/phase0_probe.py and share its report.")
 
         routable = [t for t in techs if t["active"] and t["trade_skills"] and t["home_lat"] is not None]
         need = [t for t in techs if t["active"] and not (t["trade_skills"] and t["home_lat"] is not None)]
@@ -156,9 +163,11 @@ def run_live_check(db, cfg, hcp, geocoder, routes, now: Optional[datetime] = Non
             printer(f"\n== 3. Slot finder on {min(jobs, len(located))} real job(s) ==")
             tested, with_options, broken, times = 0, 0, [], []
             reasons: dict = {}
+            horizon = days or max(CHECK_DAYS, int(settings["scheduling"]["search_days"]))
+            report["slots"]["days_searched"] = horizon
             for i, u in enumerate(located[:jobs], 1):
                 t0 = time.perf_counter()
-                res = compute_slots(conn, u["id"], settings, now, search_days=days)
+                res = compute_slots(conn, u["id"], settings, now, search_days=horizon)
                 ms = round((time.perf_counter() - t0) * 1000)
                 times.append(ms)
                 tested += 1
@@ -172,12 +181,15 @@ def run_live_check(db, cfg, hcp, geocoder, routes, now: Optional[datetime] = Non
                             f"window {b['window_start_min'] // 60:02d}:{b['window_start_min'] % 60:02d}-"
                             f"{b['window_end_min'] // 60:02d}:{b['window_end_min'] % 60:02d}, +{b['added_drive_min']:.0f} min driving ({ms} ms)")
                 else:
+                    here: dict = {}
                     for x in res["ineligible"]:
+                        here[x["reason"]] = here.get(x["reason"], 0) + 1
                         reasons[x["reason"]] = reasons.get(x["reason"], 0) + 1
-                    printer(f"  job {i} ({u['priority_label']} {trade or 'any trade'}): no slot ({ms} ms): "
-                            + (res["notes"][0] if res["notes"] else "no technician can take it"))
-            report["slots"] = {"jobs_tested": tested, "with_options": with_options, "rule_violations": len(broken),
-                               "no_slot_reasons": reasons, "ms_median": _median(times), "ms_max": max(times)}
+                    why = "; ".join(f"{r} ({n})" for r, n in sorted(here.items(), key=lambda kv: -kv[1])) \
+                        or (res["notes"][0] if res["notes"] else "no technician can take it")
+                    printer(f"  job {i} ({u['priority_label']} {trade or 'any trade'}): no slot in {horizon} days ({ms} ms): {why}")
+            report["slots"].update({"jobs_tested": tested, "with_options": with_options, "rule_violations": len(broken),
+                                    "no_slot_reasons": reasons, "ms_median": _median(times), "ms_max": max(times)})
             verdict("PASS" if with_options == tested else "WARN" if with_options else "FAIL",
                     f"The slot finder offered options for {with_options} of {tested} job(s)"
                     + ("" if with_options == tested else " (see the reasons above: skills, shifts, days or full routes)"))

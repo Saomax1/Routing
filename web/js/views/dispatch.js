@@ -373,7 +373,7 @@ export function mountDispatch(root, ctx) {
       ? section('Parsing notes', h('ul', { class: 'warns' }, w.parse_warnings.map((x) => h('li', {}, icon('alert', 13), ' ', x))),
         w.parsed_by === 'ai' ? h('p', { class: 'dim' }, 'Some fields were filled in by the AI fallback; please verify.') : null) : null;
 
-    const raw = h('details', { class: 'd-sec raw' }, h('summary', {}, 'Original description from Housecall Pro'), h('pre', {}, d.description_raw || '(empty)'));
+    const raw = h('details', { class: 'd-sec raw' }, h('summary', {}, 'Original text from Housecall Pro (description and warranty notes)'), h('pre', {}, d.description_raw || '(empty)'));
 
     render(queue, hdr, h('div', { class: 'd-body' }, alerts, d.booking ? [bookingPanel(d), scoreCard] : [scoreCard, exceptionPanel(d), slotPanel],
       section('Problem', items), contact, warranty, breakdown, warnings, raw));

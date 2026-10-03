@@ -14,7 +14,7 @@ import re
 from typing import Any, Optional
 
 from ..domain.timeutil import parse_iso, to_iso
-from ..domain.warranty_parser import keyword_present
+from ..domain.warranty_parser import keyword_present, looks_like_warranty
 
 
 def pick(d: Any, *paths: str, default=None):
@@ -105,19 +105,41 @@ def classify_source(lead_source: str, tags: list, warranty_company: Optional[str
     return "direct"
 
 
+# Where a job's private notes may be: a list of {content|text|note|body}, a list of strings, or one string.
+NOTE_KEYS = ("notes", "private_notes", "internal_notes", "job_notes")
+_NOTE_TEXT_KEYS = ("content", "text", "note", "body")
+
+
+def note_texts(raw: dict) -> list:
+    """Every non-empty note on a job, as plain strings (any of the shapes above)."""
+    out = []
+    for key in NOTE_KEYS:
+        value = raw.get(key)
+        for item in value if isinstance(value, list) else [value]:
+            if isinstance(item, dict):
+                item = next((item[k] for k in _NOTE_TEXT_KEYS if isinstance(item.get(k), str) and item[k].strip()), None)
+            if isinstance(item, str) and item.strip():
+                out.append(item.strip())
+    return out
+
+
+def warranty_notes(raw: dict) -> list:
+    """The notes that are warranty dispatch text (the only notes the app keeps)."""
+    return [t for t in note_texts(raw) if looks_like_warranty(t)]
+
+
 def normalize_job(raw: dict) -> dict:
     """Flat dict with the same keys as the ``jobs`` table (minus derived fields)."""
     addr = raw.get("address") if isinstance(raw.get("address"), dict) else {}
     cust = raw.get("customer") if isinstance(raw.get("customer"), dict) else {}
 
-    description = pick(raw, "description", "job_description", "summary", default="")
-    if not description:
-        notes = raw.get("notes")
-        if isinstance(notes, list):
-            description = "\n".join(str(n.get("content") or n.get("text") or "") if isinstance(n, dict) else str(n)
-                                    for n in notes)
-        elif isinstance(notes, str):
-            description = notes
+    description = str(pick(raw, "description", "job_description", "summary", default="") or "")
+    # Dispatch text from warranty companies is often pasted into the job's PRIVATE NOTES rather than its description.
+    # Only notes that look like a warranty dispatch are used; every other note is dropped here, before anything is
+    # stored, shown or logged (a dispatcher's gate codes and remarks are none of this app's business).
+    for text in warranty_notes(raw):
+        if text not in description:
+            description = f"{description}\n\n{text}" if description else text
 
     assigned = raw.get("assigned_employees") or raw.get("employees") or []
     assigned_ids = []

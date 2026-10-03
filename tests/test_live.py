@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -446,6 +447,28 @@ class LiveCheckTests(unittest.TestCase):
         self.assertIn(rep["overall"], ("PASS", "WARN"))
         self.assertFalse([c for c in rep["checks"] if c["level"] == "FAIL"])
         self.assertEqual(self.env.fake.methods(), {"GET"})
+
+    def test_a_friday_evening_check_still_reaches_monday(self):
+        """Run after the shift on a Friday, a 3-day look-ahead is Friday + a weekend with nobody working: the check
+        must not call routing broken for that, so it looks a week ahead."""
+        friday_evening = datetime(2026, 10, 3, 0, 30, tzinfo=timezone.utc)          # Fri 17:30 America/Phoenix
+        self.env.live_sync()
+        self.set_up_technicians()
+        rep = run_live_check(self.env.db, self.env.cfg, self.env.client(), MockGeocoder(), RoadRoutes(None), now=friday_evening,
+                             do_sync=False, printer=lambda *a: self.lines.append(" ".join(map(str, a))))
+        self.assertEqual(rep["slots"]["days_searched"], 7)
+        self.assertEqual(rep["slots"]["with_options"], rep["slots"]["jobs_tested"])
+        self.assertGreater(rep["slots"]["jobs_tested"], 0)
+        self.assertFalse([c for c in rep["checks"] if c["level"] == "FAIL"])
+
+    def test_the_look_ahead_can_be_set_and_a_miss_explains_itself(self):
+        friday_evening = datetime(2026, 10, 3, 0, 30, tzinfo=timezone.utc)
+        self.env.live_sync()
+        self.set_up_technicians()
+        rep = run_live_check(self.env.db, self.env.cfg, self.env.client(), MockGeocoder(), RoadRoutes(None), now=friday_evening,
+                             do_sync=False, days=2, printer=lambda *a: self.lines.append(" ".join(map(str, a))))
+        self.assertEqual((rep["slots"]["days_searched"], rep["slots"]["with_options"]), (2, 0))
+        self.assertTrue(any("no slot in 2 days" in ln and re.search(r"\(\d+\)$", ln) for ln in self.lines), self.lines)   # with why
 
     def test_it_syncs_first_when_asked(self):
         self.set_up_technicians()
