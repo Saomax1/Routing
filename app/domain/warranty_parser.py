@@ -52,7 +52,8 @@ class WarrantyJob:
     trade_code: Optional[str] = None             # e.g. "PLB", "HVAC", "APPL"
     dispatch_priority: Optional[str] = None      # Normal / Expedited / Emergency
     priority_rank: int = 0                       # 3 = emergency, 2 = expedited, 1 = normal
-    header_secondary_code: Optional[str] = None  # value after the colon in the header line
+    header_priority: Optional[str] = None  # word before the colon in the header line ("Normal", "Expedited")
+    header_secondary_code: Optional[str] = None  # value after the colon in the header line ("NORMAL", "RECALL")
     authorization_required: Optional[bool] = None
     service_request_id: Optional[str] = None
     vendor_id: Optional[str] = None
@@ -170,7 +171,8 @@ def parse_warranty_job(raw: str) -> WarrantyJob:
     if header:
         job.dispatch_number = job.dispatch_number or header.group(1)
         job.trade_code = header.group(2).upper()
-        job.header_secondary_code = header.group(4).upper()  # stored, NOT used for priority
+        job.header_priority = header.group(3).capitalize()  # stored; dispatch_priority itself comes from the body
+        job.header_secondary_code = header.group(4).upper()
 
     brand = _find(r"This is an?\s+(\w+)\s+customer", text)
     if brand:

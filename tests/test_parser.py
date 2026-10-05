@@ -141,6 +141,10 @@ class RobustnessTests(unittest.TestCase):
             self.assertEqual(j.parse_warnings, [])
             self.assertEqual(missing_key_fields(j), [])
 
+    def test_header_words_are_kept(self):
+        j = parse_warranty_job(build_ahs_description(priority="Expedited", header_code="RECALL"))
+        self.assertEqual((j.header_priority, j.header_secondary_code, j.dispatch_priority), ("Expedited", "RECALL", "Expedited"))
+
     def test_no_unit_line_leaves_street_line_2_empty(self):
         self.assertIsNone(parse_warranty_job(build_ahs_description()).street_line_2)
 

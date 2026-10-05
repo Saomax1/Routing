@@ -72,6 +72,20 @@ class ClassifyTests(unittest.TestCase):
                              ("warranty", label, label, False), prio)
         self.assertEqual(kind(["Dispatch.Me", "Meta Lead"], warranty={"dispatch_priority": "Normal"})["ad_lead"], False)
 
+    def test_header_line_words_pick_the_tier(self):
+        """Headers look like "<no> PLB Normal:NORMAL", "<no> PLB Expedited:NORMAL", "<no> PLB Normal:RECALL"."""
+        for header_priority, code, body, label in (("Normal", "NORMAL", "Normal", "Normal"),
+                                                   ("Expedited", "NORMAL", "Normal", "Expedited"),
+                                                   ("Normal", "RECALL", "Normal", "Recall"),
+                                                   ("Normal", "RECALL", "Expedited", "Expedited")):
+            w = {"dispatch_priority": body, "data": {"header_priority": header_priority, "header_secondary_code": code}}
+            self.assertEqual(kind(["dispatch.me"], warranty=w)["label"], label, (header_priority, code, body))
+
+    def test_the_word_recall_in_the_body_text_alone_is_not_a_recall(self):
+        """Every AHS dispatch says "30-DAY RECALL APPLIES"; only the header code RECALL (or a priority tag) counts."""
+        w = {"dispatch_priority": "Normal", "data": {"recall_applies": True, "header_secondary_code": "NORMAL"}}
+        self.assertEqual(kind(["dispatch.me"], warranty=w)["label"], "Normal")
+
     def test_a_source_tag_without_dispatch_text_stays_retail(self):
         k = kind(["dispatch.me"])
         self.assertEqual((k["kind"], k["label"], k["warranty_text_without_tag"]), ("retail", "Retail", False))

@@ -34,7 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.config import load_config  # noqa: E402
 from app.domain.jobkind import DEFAULT_JOB_TYPES, classify_job  # noqa: E402
-from app.domain.warranty_parser import looks_like_warranty, missing_key_fields, parse_warranty_job  # noqa: E402
+from app.domain.warranty_parser import looks_like_warranty, missing_key_fields, parse_warranty_job, to_dict  # noqa: E402
 from app.hcp.client import HCPClient, MockHCPClient  # noqa: E402
 from app.hcp.diagnose import explain_http_error  # noqa: E402
 from app.hcp.http import HttpError  # noqa: E402
@@ -176,7 +176,7 @@ def run_probe(client, limit=20, show_failures=False, tz=ZoneInfo("America/Phoeni
         n = normalize_job(j)
         w = parse_warranty_job(n["description_raw"]) if looks_like_warranty(n["description_raw"]) else None
         k = classify_job({"tags": n["tags"], "lead_source": n["lead_source"]}, {"job_types": DEFAULT_JOB_TYPES},
-                         warranty={"dispatch_priority": w.dispatch_priority} if w else None)
+                         warranty=to_dict(w) if w else None)
         typed[k["label"] + (" (ad lead)" if k["ad_lead"] else "")] += 1
         typed["warranty text but no tag"] += 1 if k["warranty_text_without_tag"] else 0
     typed = Counter({k: v for k, v in typed.items() if v})

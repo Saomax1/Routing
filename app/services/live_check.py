@@ -25,6 +25,7 @@ from datetime import date, datetime, timezone
 from typing import Callable, List, Optional
 from zoneinfo import ZoneInfo
 
+from ..db import jload
 from ..domain.jobkind import TYPE_LABELS, classify_job, count_types
 from ..domain.timeutil import hhmm_to_minutes
 from ..domain.travel import HaversineTravel, haversine_miles
@@ -137,8 +138,8 @@ def run_live_check(db, cfg, hcp, geocoder, routes, now: Optional[datetime] = Non
                             "python scripts/phase0_probe.py and share its report.")
 
         # how every open job was typed, and which tags are in use (tag names stay on this screen, never in the report)
-        have_text = {r[0]: {"dispatch_priority": r[1]}
-                     for r in conn.execute("SELECT hcp_job_id, dispatch_priority FROM warranty_details")}
+        have_text = {r[0]: {"dispatch_priority": r[1], "data": jload(r[2], {})}
+                     for r in conn.execute("SELECT hcp_job_id, dispatch_priority, data FROM warranty_details")}
         kinds, tag_counts = [], {}
         for r in conn.execute("SELECT * FROM jobs WHERE active = 1 AND work_status != 'complete'"):
             j = job_dict(r)
