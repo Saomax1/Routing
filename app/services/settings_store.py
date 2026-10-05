@@ -6,8 +6,8 @@ TARGETS, not hard limits: a dispatcher can waive a job's deadline and record why
 ``services/job_exceptions.py``). A type with no rule simply has no deadline clock. Normal warranty calls are
 48 h; the Expedited, Recall and Retail values are still placeholders - confirm them under Admin > Settings.
 
-Job types (``job_types``): warranty work is Expedited, Normal or Recall, told apart by three Housecall Pro tags;
-everything else is Retail (``domain/jobkind.py``). The tag texts are editable here.
+Job types (``job_types``): warranty work is Expedited, Normal or Recall, told apart by three Housecall Pro tags (or a
+warranty source tag such as "dispatch.me" plus the dispatch text's priority); everything else is Retail (``domain/jobkind.py``). The tag texts are editable here.
 """
 
 from __future__ import annotations

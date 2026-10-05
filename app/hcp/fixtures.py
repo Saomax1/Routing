@@ -28,6 +28,7 @@ def build_ahs_description(
     name: str = "JANE SAMPLE",
     phone: str = "4805550101",
     street: Optional[str] = "123 W EXAMPLE ST",
+    unit: Optional[str] = None,
     city: Optional[str] = "CHANDLER",
     state: str = "AZ",
     zip_code: Optional[str] = "85226",
@@ -67,6 +68,8 @@ def build_ahs_description(
     ]
     if include_address and street:
         lines += ["# Covered Property Address", "", street]
+        if unit:
+            lines.append(unit)  # AHS puts a unit on its own line with no space, e.g. "UNIT1234"
         if city and zip_code:
             lines.append(f"{city}, {state} {zip_code}")
         lines.append("")

@@ -30,7 +30,8 @@ read-only key as the environment variable `HCP_API_KEY`, then starts a new sessi
 The key may instead be stored as an **API credential** in the environment settings (an `Authorization` header with the key as its
 value, allowed for `api.housecallpro.com`). Then the proxy adds the header to requests to that host and the key is never in the
 container, so `HCP_API_KEY` is not set. The app still insists on a non-empty `HCP_API_KEY` in live mode: export a harmless
-placeholder (`export HCP_API_KEY=injected-by-proxy`). If the stored header scheme is not the one the app sends (`HCP_AUTH_SCHEME`,
+placeholder that appears nowhere in the repo (`export HCP_API_KEY=proxy-$RANDOM`; the leak guard treats the value as a secret, so a
+placeholder written in this file would block every commit). If the stored header scheme is not the one the app sends (`HCP_AUTH_SCHEME`,
 default `Token`), or the proxy does not replace the app's own header, a 401 on step 2 or 5 is the symptom: check what the proxy does
 before changing code.
 
@@ -49,14 +50,20 @@ before changing code.
 8. Fix what the real data shows (tag names, field names, parsing) in code, with tests that use made-up data. Run
    `python scripts/leak_check.py --tree` before each commit.
 
-HCP request details (auth scheme, paths, parameter names, where private notes live) were written from documentation and had not been
-seen against a live account when this was written: `app/hcp/client.py` and `app/hcp/normalize.py` isolate all of it.
+HCP request details are isolated in `app/hcp/client.py` and `app/hcp/normalize.py`. **Confirmed against the live account on
+2026-10-05** (read-only run, key injected by the proxy as a stored API credential): `/employees` and `/jobs` with `work_status[]`,
+`scheduled_start_min|max`, `page`, `page_size`; jobs carry `notes: [{id, content}]` (private notes come back), `tags` as plain
+strings, `schedule.arrival_window` in minutes (240 on every job), `address.latitude/longitude`, `job_fields.job_type` (empty);
+employees have no `active` flag. AHS dispatch text lives in a private note, never the description. Warranty jobs carry the tag
+`dispatch.me`, not the `normal: ...` priority tags. An AHS address can have a unit line ("Unit1234") between the street and the
+city line.
 
 ## Working on the code
 
 - Tests: `python -m unittest discover -s tests -t .` (standard library only). Keep them passing; the suite is also run under simulated
   clocks (weekday/weekend, morning/evening) because the demo data and slot results depend on the time of day.
 - Run the app: `python -m app` (demo data by default, `HCP_MODE=live` for real data).
-- A job's type (Expedited / Normal / Recall warranty, or Retail) comes from its HCP tags: `app/domain/jobkind.py`.
+- A job's type (Expedited / Normal / Recall warranty, or Retail) comes from its HCP tags, or from a warranty source tag
+  (`dispatch.me`) plus the dispatch text's priority: `app/domain/jobkind.py`.
 - Unscheduled jobs are the same red "!" on the map and a plain row (type, customer, address) in the list; colour only appears once a job
   is on a technician's route.
