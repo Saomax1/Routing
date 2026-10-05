@@ -27,9 +27,17 @@ When `HCP_API_KEY` is set in the environment this is a LIVE session and the data
 The user adds, in the cloud environment's settings, `api.housecallpro.com` and `geocoding.geo.census.gov` to the allowed domains and a
 read-only key as the environment variable `HCP_API_KEY`, then starts a new session. Never ask them to paste a key into chat.
 
+The key may instead be stored as an **API credential** in the environment settings (an `Authorization` header with the key as its
+value, allowed for `api.housecallpro.com`). Then the proxy adds the header to requests to that host and the key is never in the
+container, so `HCP_API_KEY` is not set. The app still insists on a non-empty `HCP_API_KEY` in live mode: export a harmless
+placeholder (`export HCP_API_KEY=injected-by-proxy`). If the stored header scheme is not the one the app sends (`HCP_AUTH_SCHEME`,
+default `Token`), or the proxy does not replace the app's own header, a 401 on step 2 or 5 is the symptom: check what the proxy does
+before changing code.
+
 1. `python scripts/install_git_guard.py`
 2. Check reachability without printing secrets: `env | grep -o '^HCP_[A-Z_]*'` (names only) and
-   `curl -sS -m 10 -o /dev/null -w '%{http_code}\n' https://api.housecallpro.com/employees` (401 = reachable, 000 = blocked).
+   `curl -sS -m 10 -o /dev/null -w '%{http_code}\n' https://api.housecallpro.com/employees` (401 = reachable, 000 = blocked; with a
+   stored API credential 200 = reachable and the key is being injected, 401 = the stored header is wrong). Never print the body.
 3. Install dependencies in a venv in the scratchpad: `python -m venv <scratchpad>/venv && <scratchpad>/venv/bin/pip install -r requirements.txt`.
 4. Use environment variables only: `LIVE=<scratchpad>/live; mkdir -p $LIVE; export DATABASE_PATH=$LIVE/live.db HCP_MODE=live
    GEOCODER=census ROUTER=none` (`ROUTER=none`: road routing would send customer locations to a third party).
