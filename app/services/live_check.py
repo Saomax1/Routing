@@ -137,11 +137,12 @@ def run_live_check(db, cfg, hcp, geocoder, routes, now: Optional[datetime] = Non
                             "python scripts/phase0_probe.py and share its report.")
 
         # how every open job was typed, and which tags are in use (tag names stay on this screen, never in the report)
-        have_text = {r[0] for r in conn.execute("SELECT hcp_job_id FROM warranty_details")}
+        have_text = {r[0]: {"dispatch_priority": r[1]}
+                     for r in conn.execute("SELECT hcp_job_id, dispatch_priority FROM warranty_details")}
         kinds, tag_counts = [], {}
         for r in conn.execute("SELECT * FROM jobs WHERE active = 1 AND work_status != 'complete'"):
             j = job_dict(r)
-            kinds.append(classify_job(j, settings, {"x": 1} if j["hcp_job_id"] in have_text else None))
+            kinds.append(classify_job(j, settings, have_text.get(j["hcp_job_id"])))
             for t in j["tags"]:
                 tag_counts[str(t)] = tag_counts.get(str(t), 0) + 1
         by_type = count_types(kinds)

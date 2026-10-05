@@ -63,6 +63,39 @@ class ClassifyTests(unittest.TestCase):
         self.assertFalse(kind(["warranty"])["warranty_text_without_tag"])                        # no text, nothing to flag
         self.assertFalse(kind(["Normal: Normal"], warranty={"data": {}})["warranty_text_without_tag"])   # tagged: it is warranty
 
+    def test_a_source_tag_with_dispatch_text_is_warranty_tiered_by_the_text(self):
+        """Seen live: warranty jobs carry "dispatch.me" (from the Dispatch.me integration) and no priority tag."""
+        for prio, label in (("Normal", "Normal"), ("Expedited", "Expedited"), ("EMERGENCY", "Expedited"),
+                            (None, "Normal"), ("Odd", "Normal")):
+            k = kind(["dispatch.me"], warranty={"dispatch_priority": prio})
+            self.assertEqual((k["kind"], k["label"], k["tier"], k["warranty_text_without_tag"]),
+                             ("warranty", label, label, False), prio)
+        self.assertEqual(kind(["Dispatch.Me", "Meta Lead"], warranty={"dispatch_priority": "Normal"})["ad_lead"], False)
+
+    def test_a_source_tag_without_dispatch_text_stays_retail(self):
+        k = kind(["dispatch.me"])
+        self.assertEqual((k["kind"], k["label"], k["warranty_text_without_tag"]), ("retail", "Retail", False))
+
+    def test_dispatch_text_without_a_source_tag_stays_retail_and_flagged(self):
+        """A converted job keeps its old text but loses the source tag: still Retail."""
+        k = kind([], warranty={"dispatch_priority": "Expedited"})
+        self.assertEqual((k["kind"], k["label"], k["warranty_text_without_tag"]), ("retail", "Retail", True))
+
+    def test_a_priority_tag_wins_over_the_text(self):
+        self.assertEqual(kind(["dispatch.me", "normal: recall"], warranty={"dispatch_priority": "Expedited"})["label"], "Recall")
+
+    def test_source_tags_are_a_setting_and_can_be_turned_off(self):
+        off = deep_merge(SETTINGS, {"job_types": {"warranty_source_tags": []}})
+        self.assertEqual(kind(["dispatch.me"], warranty={"dispatch_priority": "Normal"}, settings=off)["label"], "Retail")
+        other = deep_merge(SETTINGS, {"job_types": {"warranty_source_tags": ["AHS"]}})
+        self.assertEqual(kind(["ahs"], warranty={"dispatch_priority": "Expedited"}, settings=other)["label"], "Expedited")
+        with self.assertRaises(ValueError):
+            validate_job_types({"warranty_source_tags": ["dispatch.me"], "ad_lead_tags": ["Dispatch.me"]})
+        with self.assertRaises(ValueError):
+            validate_job_types({"warranty_tags": {"Normal": ["dispatch.me"]}, "warranty_source_tags": ["dispatch.me"]})
+        with self.assertRaises(ValueError):
+            validate_job_types({"warranty_source_tags": [""]})
+
     def test_the_tag_names_are_settings(self):
         s = deep_merge(SETTINGS, {"job_types": {"warranty_tags": {"Expedited": ["Rush", "ASAP"]}, "ad_lead_tags": ["Facebook ad"]}})
         self.assertEqual(kind(["asap"], settings=s)["label"], "Expedited")

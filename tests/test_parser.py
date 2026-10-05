@@ -130,6 +130,20 @@ class RobustnessTests(unittest.TestCase):
         self.assertIn("address", missing_key_fields(j))
         self.assertTrue(j.is_warranty)  # still recognised as a warranty job
 
+    def test_unit_line_between_street_and_city(self):
+        # Seen live: "Unit1234" on its own line under the street made the whole address "incomplete"
+        for unit, expected in (("Unit1234", "Unit 1234"), ("UNIT 7", "Unit 7"), ("APT 12B", "Apt 12B"), ("#5", "#5")):
+            j = parse_warranty_job(build_ahs_description(unit=unit))
+            self.assertEqual((j.street, j.street_line_2, j.city, j.state, j.zip_code),
+                             ("123 W Example St", expected, "Chandler", "AZ", "85226"), unit)
+            # the unit stays out of the geocoding address
+            self.assertEqual(j.full_address, "123 W Example St, Chandler, AZ 85226")
+            self.assertEqual(j.parse_warnings, [])
+            self.assertEqual(missing_key_fields(j), [])
+
+    def test_no_unit_line_leaves_street_line_2_empty(self):
+        self.assertIsNone(parse_warranty_job(build_ahs_description()).street_line_2)
+
     def test_street_only_address_is_incomplete(self):
         j = parse_warranty_job(build_ahs_description(city=None, zip_code=None))
         self.assertIsNone(j.full_address)

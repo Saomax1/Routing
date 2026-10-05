@@ -62,6 +62,7 @@ class WarrantyJob:
     contact_name: Optional[str] = None
     contact_phones: list = field(default_factory=list)
     street: Optional[str] = None
+    street_line_2: Optional[str] = None  # unit / apartment line, e.g. "Unit 12" (kept out of full_address for geocoding)
     city: Optional[str] = None
     state: Optional[str] = None
     zip_code: Optional[str] = None
@@ -222,10 +223,15 @@ def parse_warranty_job(raw: str) -> WarrantyJob:
         lines = [ln.strip() for ln in addr_block.strip().splitlines() if ln.strip()]
         if lines:
             job.street = title_case(lines[0])
-        if len(lines) >= 2:
-            m = re.match(r"(.+?),\s*([A-Za-z]{2})\s+(\d{5}(?:-\d{4})?)", lines[1])
+        # The city line is usually right under the street, but a unit line ("Unit1234", "Apt 5") can sit between them.
+        for i, ln in enumerate(lines[1:4], start=1):
+            m = re.match(r"(.+?),\s*([A-Za-z]{2})\s+(\d{5}(?:-\d{4})?)", ln)
             if m:
                 job.city, job.state, job.zip_code = title_case(m.group(1)), m.group(2).upper(), m.group(3)
+                extra = " ".join(lines[1:i])
+                if extra:
+                    job.street_line_2 = re.sub(r"^([A-Za-z.]+?)\s*(?=\d)", r"\1 ", extra).strip().title()
+                break
         if job.street and job.city and job.state and job.zip_code:
             job.full_address = f"{job.street}, {job.city}, {job.state} {job.zip_code}"
         elif job.street:
